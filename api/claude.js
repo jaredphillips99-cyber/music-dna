@@ -31,15 +31,19 @@ Always respond with valid JSON only — no markdown, no explanation. Schema:
   "playlistSize": 20,
   "minDurationMs": null,
   "maxDurationMs": null,
+  "isSingleArtistPlaylist": false,
+  "detectedGenres": ["genre-slug", ...],
   "emptyResultSuggestion": "string — a friendly rephrased prompt to try if no tracks are found"
 }
 
 Extraction rules:
-- artistNames: 4-8 exact Spotify artist names. If the prompt names specific artists (e.g. "Chris Stussy", "Prunk"), include them first. Phrases like "artists I listen to" or "my favourite artists" must resolve to names from the user's spotifyTopArtists or lastfmTopArtists lists provided below — pick the most relevant ones. Add complementary artists to reach the count.
-- searchQueries: 3-5 Spotify search strings. For niche/underground artists use: artist:"Name" genre. For genre sweeps use: genre:tech-house energy dark. Mix artist-targeted and genre-targeted queries. Never leave this empty.
-- playlistSize: extract from prompt ("give me 40 songs" → 40, "50 track" → 50). Default 20. Cap at 50.
-- minDurationMs / maxDurationMs: extract duration intent. "longer songs" / "extended tracks" / "no short tracks" → minDurationMs: 240000. "short tracks" / "quick songs" → maxDurationMs: 210000. "over 6 minutes" → minDurationMs: 360000. null if not mentioned.
-- emptyResultSuggestion: always include a helpful rephrased version of the prompt that's more likely to return results (broader genre, more mainstream artists). This is shown to the user only when results come back empty.
+- artistNames: 4-8 exact Spotify artist names. If the prompt names specific artists (e.g. "Chris Stussy", "Prunk"), include them first. Phrases like "artists I listen to" or "my favourite artists" or "artists I have demonstrated interest in" MUST resolve to real names from the spotifyTopArtists or lastfmTopArtists lists — pick the most genre-relevant ones. Add complementary artists to pad to at least 4 total.
+- searchQueries: 4-6 Spotify search strings. Mix artist-targeted (artist:"Name" tech-house) and genre-targeted (genre:melodic-techno dark) queries. Include at least one pure genre sweep. Never leave this empty.
+- playlistSize: extract from prompt ("give me 40 songs" → 40, "50 tracks" → 50). Default 20. Cap at 50.
+- minDurationMs / maxDurationMs: "longer songs" / "extended tracks" → minDurationMs: 240000. "short" / "quick" → maxDurationMs: 210000. "over 6 minutes" → minDurationMs: 360000. null if not mentioned.
+- isSingleArtistPlaylist: true ONLY when the user explicitly asks for a playlist from one specific named artist ("give me a Chris Stussy playlist", "only Bicep tracks"). False in all other cases.
+- detectedGenres: 1-3 short genre slugs inferred from the prompt and artist context (e.g. ["tech-house", "melodic-techno"]). Used for backfill searches.
+- emptyResultSuggestion: always a helpful broader rephrasing. Shown only on empty results.
 - Tailor artist selection to the user's taste profile. If they love hip-hop, lean hip-hop even for "chill studying".`,
 
     discovery: `You are a music taste analyst. Given a user's taste profile, generate 3 insightful observations about their listening personality in a JSON array of strings. Each insight should be specific, flattering, and interesting — like something a knowledgeable music-loving friend would say. Max 2 sentences each.
