@@ -3,7 +3,7 @@ import { Send, Loader2, Save, Play, ExternalLink } from 'lucide-react'
 import useStore from '@/store/useStore'
 import { useSpotify } from '@/hooks/useSpotify'
 import { getPlaylistParams } from '@/lib/claude'
-import { getRecommendations, createPlaylist, addTracksToPlaylist } from '@/lib/spotify'
+import { searchArtists, searchTracks, getArtistTopTracks, getMe, createPlaylist, addTracksToPlaylist } from '@/lib/spotify'
 import TrackCard from '@/components/Playlist/TrackCard'
 import LastfmImport from '@/components/Dashboard/LastfmImport'
 
@@ -33,35 +33,59 @@ export default function DiscoverPage() {
     setSavedUrl(null)
 
     try {
-      const profile = {
-        ...tasteProfile,
-        lastfmUsername,
-      }
+      const profile = { ...tasteProfile, lastfmUsername }
       const params = await getPlaylistParams(text, profile)
       const token = await getToken()
       if (!token) throw new Error('Not authenticated')
 
-      // Remove seed_artists if they are placeholder IDs
-      const recParams = {
-        seed_genres: params.seed_genres?.slice(0, 3).join(','),
-        target_energy: params.target_energy,
-        target_valence: params.target_valence,
-        target_danceability: params.target_danceability,
-        target_tempo: params.target_tempo,
-        min_popularity: params.min_popularity ?? 20,
-        limit: params.limit ?? 20,
+      const seenIds = new Set()
+      const tracks = []
+
+      function addTracks(items) {
+        for (const t of items) {
+          if (t?.id && !seenIds.has(t.id)) {
+            seenIds.add(t.id)
+            tracks.push(t)
+          }
+        }
       }
 
-      // Only add seed_artists if we have real Spotify IDs (22-char alphanumeric)
-      if (params.seed_artists?.length && /^[A-Za-z0-9]{22}$/.test(params.seed_artists[0])) {
-        recParams.seed_artists = params.seed_artists.slice(0, 2).join(',')
+      // 1. Resolve artist names → IDs → top tracks
+      const artistNames = params.artistNames ?? []
+      await Promise.all(
+        artistNames.slice(0, 6).map(async (name) => {
+          try {
+            const res = await searchArtists(token, name, 1)
+            const artist = res?.artists?.items?.[0]
+            if (!artist) return
+            const top = await getArtistTopTracks(token, artist.id)
+            addTracks((top?.tracks ?? []).slice(0, 4))
+          } catch {}
+        })
+      )
+
+      // 2. Run search queries for additional variety
+      const queries = params.searchQueries ?? []
+      await Promise.all(
+        queries.slice(0, 4).map(async (q) => {
+          try {
+            const res = await searchTracks(token, q, 5)
+            addTracks(res?.tracks?.items ?? [])
+          } catch {}
+        })
+      )
+
+      if (tracks.length === 0) {
+        throw new Error('No tracks found — try rephrasing your prompt.')
       }
 
-      const data = await getRecommendations(token, recParams)
+      // Shuffle and cap at 20
+      const shuffled = tracks.sort(() => Math.random() - 0.5).slice(0, 20)
+
       setPlaylist({
         name: params.playlistName || text,
         description: params.description || '',
-        tracks: data.tracks || [],
+        tracks: shuffled,
       })
     } catch (err) {
       setError(err.message || 'Something went wrong. Try a different prompt.')
@@ -71,11 +95,18 @@ export default function DiscoverPage() {
   }
 
   async function saveToSpotify() {
-    if (!playlist || !spotifyUser) return
+    if (!playlist) return
     setSaving(true)
     try {
       const token = await getToken()
-      const pl = await createPlaylist(token, spotifyUser.id, playlist.name, playlist.description)
+      // Ensure we have the user's Spotify ID before creating the playlist
+      let userId = spotifyUser?.id
+      if (!userId) {
+        const me = await getMe(token)
+        userId = me.id
+        useStore.getState().setSpotifyUser(me)
+      }
+      const pl = await createPlaylist(token, userId, playlist.name, playlist.description)
       const uris = playlist.tracks.map((t) => t.uri)
       await addTracksToPlaylist(token, pl.id, uris)
       setSavedUrl(pl.external_urls?.spotify)

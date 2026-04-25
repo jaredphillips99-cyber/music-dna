@@ -20,24 +20,20 @@ export default async function handler(req, res) {
   }
 
   const systemPrompts = {
-    playlist: `You are a music expert and playlist curator. When given a natural language description and a user's taste profile, you translate it into Spotify Recommendations API parameters.
+    playlist: `You are a music expert and playlist curator. When given a natural language description and a user's taste profile, you identify the right artists and search queries to build the playlist using the Spotify Search and Artist Top Tracks APIs.
 
 Always respond with valid JSON only — no markdown, no explanation. The JSON shape must be:
 {
   "playlistName": "string",
-  "description": "string",
-  "seed_artists": ["spotify_artist_id", ...],  // 0-2 items, only if you know real Spotify IDs
-  "seed_genres": ["genre1", "genre2"],          // 1-3 items from Spotify's valid genre list
-  "seed_tracks": [],
-  "target_energy": 0.0-1.0,
-  "target_valence": 0.0-1.0,
-  "target_danceability": 0.0-1.0,
-  "target_tempo": 60-200,
-  "min_popularity": 0-100,
-  "limit": 20
+  "description": "string (1-2 sentences describing the vibe)",
+  "artistNames": ["Artist Name 1", "Artist Name 2", "Artist Name 3", "Artist Name 4", "Artist Name 5"],
+  "searchQueries": ["spotify search query 1", "spotify search query 2", "spotify search query 3"]
 }
 
-Valid Spotify genres include: acoustic, afrobeat, alt-rock, alternative, ambient, blues, chill, classical, club, country, dance, deep-house, drum-and-bass, edm, electro, electronic, folk, funk, gospel, hip-hop, house, indie, indie-pop, jazz, latin, metal, pop, punk, r-n-b, reggae, rock, sad, soul, study, work-out, and more.`,
+Rules:
+- artistNames: 3-6 real, well-known artist names that fit the mood/genre requested. Use the user's taste profile to pick artists they would enjoy. These must be exact artist names as they appear on Spotify.
+- searchQueries: 2-4 Spotify search queries to find additional tracks. Use genre tags, mood words, and year filters. Examples: "genre:lo-fi study beats", "genre:indie-pop feel good 2022", "genre:hip-hop workout high energy". Keep queries specific but not overly narrow.
+- Tailor everything to the user's taste profile — if they love hip-hop, lean hip-hop even if the prompt is "chill studying".`,
 
     discovery: `You are a music taste analyst. Given a user's taste profile, generate 3 insightful observations about their listening personality in a JSON array of strings. Each insight should be specific, flattering, and interesting — like something a knowledgeable music-loving friend would say. Max 2 sentences each.
 

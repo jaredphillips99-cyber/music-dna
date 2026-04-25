@@ -78,22 +78,20 @@ export const getTopTracks = (token, timeRange = 'medium_term', limit = 20) =>
 export const getRecentlyPlayed = (token, limit = 20) =>
   spotifyFetch(`/me/player/recently-played?limit=${limit}`, token)
 
-export const getRecommendations = (token, params) => {
-  const q = new URLSearchParams()
-  Object.entries(params).forEach(([k, v]) => {
-    if (v !== undefined && v !== null && v !== '') q.set(k, v)
-  })
-  return spotifyFetch(`/recommendations?${q}`, token)
-}
+export const searchArtists = (token, query, limit = 5) =>
+  spotifyFetch(`/search?q=${encodeURIComponent(query)}&type=artist&limit=${limit}`, token)
+
+export const searchTracks = (token, query, limit = 5) =>
+  spotifyFetch(`/search?q=${encodeURIComponent(query)}&type=track&limit=${limit}`, token)
+
+export const getArtistTopTracks = (token, artistId) =>
+  spotifyFetch(`/artists/${artistId}/top-tracks?market=from_token`, token)
 
 export const getRelatedArtists = (token, artistId) =>
   spotifyFetch(`/artists/${artistId}/related-artists`, token)
 
 export const getArtist = (token, artistId) =>
   spotifyFetch(`/artists/${artistId}`, token)
-
-export const searchArtists = (token, query, limit = 5) =>
-  spotifyFetch(`/search?q=${encodeURIComponent(query)}&type=artist&limit=${limit}`, token)
 
 export async function createPlaylist(token, userId, name, description) {
   return spotifyFetch(`/users/${userId}/playlists`, token, {
