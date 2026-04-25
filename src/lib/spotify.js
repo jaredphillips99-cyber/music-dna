@@ -78,8 +78,13 @@ export const getTopTracks = (token, timeRange = 'medium_term', limit = 20) =>
 export const getRecentlyPlayed = (token, limit = 20) =>
   spotifyFetch(`/me/player/recently-played?limit=${limit}`, token)
 
+// Broad artist search (name as free text)
 export const searchArtists = (token, query, limit = 5) =>
   spotifyFetch(`/search?q=${encodeURIComponent(query)}&type=artist&limit=${limit}`, token)
+
+// Strict artist search using Spotify's artist: field filter — more precise for known names
+export const searchArtistStrict = (token, name, limit = 3) =>
+  spotifyFetch(`/search?q=${encodeURIComponent(`artist:"${name}"`)}&type=artist&limit=${limit}`, token)
 
 export const searchTracks = (token, query, limit = 5) =>
   spotifyFetch(`/search?q=${encodeURIComponent(query)}&type=track&limit=${limit}`, token)

@@ -1,9 +1,19 @@
 import { useState } from 'react'
-import { Send, Loader2, Save, Play, ExternalLink } from 'lucide-react'
+import { Send, Loader2, Save, ExternalLink, RefreshCw } from 'lucide-react'
 import useStore from '@/store/useStore'
 import { useSpotify } from '@/hooks/useSpotify'
 import { getPlaylistParams } from '@/lib/claude'
-import { searchArtists, searchTracks, getArtistTopTracks, getMe, createPlaylist, addTracksToPlaylist } from '@/lib/spotify'
+import {
+  searchArtists,
+  searchArtistStrict,
+  searchTracks,
+  getArtistTopTracks,
+  getRelatedArtists,
+  getTopArtists,
+  getMe,
+  createPlaylist,
+  addTracksToPlaylist,
+} from '@/lib/spotify'
 import TrackCard from '@/components/Playlist/TrackCard'
 import LastfmImport from '@/components/Dashboard/LastfmImport'
 
@@ -15,82 +25,188 @@ const EXAMPLE_PROMPTS = [
   'Focus music with no lyrics for deep work',
 ]
 
+// Resolve an artist name → Spotify artist object.
+// Tries strict `artist:"Name"` first, falls back to plain name search.
+async function resolveArtist(token, name) {
+  try {
+    const strict = await searchArtistStrict(token, name, 3)
+    const match = strict?.artists?.items?.find(
+      (a) => a.name.toLowerCase() === name.toLowerCase()
+    ) ?? strict?.artists?.items?.[0]
+    if (match) return match
+  } catch {}
+  try {
+    const broad = await searchArtists(token, name, 3)
+    return broad?.artists?.items?.[0] ?? null
+  } catch {}
+  return null
+}
+
+// Collect tracks from an artist: their own top tracks + optionally related artists' top tracks.
+async function collectArtistTracks(token, artistName, includeRelated = false) {
+  const artist = await resolveArtist(token, artistName)
+  if (!artist) return []
+
+  const tracks = []
+  try {
+    const top = await getArtistTopTracks(token, artist.id)
+    tracks.push(...(top?.tracks ?? []))
+  } catch {}
+
+  if (includeRelated && tracks.length < 5) {
+    try {
+      const related = await getRelatedArtists(token, artist.id)
+      const relArtists = (related?.artists ?? []).slice(0, 3)
+      await Promise.all(
+        relArtists.map(async (ra) => {
+          try {
+            const rt = await getArtistTopTracks(token, ra.id)
+            tracks.push(...(rt?.tracks ?? []).slice(0, 3))
+          } catch {}
+        })
+      )
+    } catch {}
+  }
+
+  return tracks
+}
+
 export default function DiscoverPage() {
-  const { tasteProfile, spotifyUser, lastfmUsername } = useStore()
+  const {
+    tasteProfile,
+    spotifyUser,
+    lastfmData,
+    lastfmUsername,
+    spotifyTopArtistNames,
+    setSpotifyTopArtistNames,
+  } = useStore()
   const { getToken } = useSpotify()
+
   const [prompt, setPrompt] = useState('')
   const [loading, setLoading] = useState(false)
+  const [loadingStep, setLoadingStep] = useState('')
   const [saving, setSaving] = useState(false)
   const [playlist, setPlaylist] = useState(null)
   const [error, setError] = useState(null)
+  const [suggestion, setSuggestion] = useState(null)
   const [savedUrl, setSavedUrl] = useState(null)
+
+  // Lazily fetch and cache the user's Spotify top artist names once per session.
+  async function ensureSpotifyHistory(token) {
+    if (spotifyTopArtistNames?.length) return spotifyTopArtistNames
+    try {
+      const data = await getTopArtists(token, 'medium_term', 30)
+      const names = (data?.items ?? []).map((a) => a.name).filter(Boolean)
+      if (names.length) setSpotifyTopArtistNames(names)
+      return names
+    } catch {
+      return []
+    }
+  }
 
   async function generate(text) {
     if (!text.trim()) return
     setLoading(true)
+    setLoadingStep('Asking Claude to interpret your vibe…')
     setError(null)
+    setSuggestion(null)
     setPlaylist(null)
     setSavedUrl(null)
 
     try {
-      const profile = { ...tasteProfile, lastfmUsername }
-      const params = await getPlaylistParams(text, profile)
       const token = await getToken()
       if (!token) throw new Error('Not authenticated')
+
+      // Warm the history cache before calling Claude
+      const topArtistNames = await ensureSpotifyHistory(token)
+
+      const profile = {
+        ...tasteProfile,
+        lastfmUsername,
+        lastfmData,
+        spotifyTopArtistNames: topArtistNames,
+      }
+
+      const params = await getPlaylistParams(text, profile)
+
+      const targetSize = Math.min(Math.max(params.playlistSize ?? 20, 1), 50)
+      const minMs = params.minDurationMs ?? null
+      const maxMs = params.maxDurationMs ?? null
 
       const seenIds = new Set()
       const tracks = []
 
       function addTracks(items) {
         for (const t of items) {
-          if (t?.id && !seenIds.has(t.id)) {
-            seenIds.add(t.id)
-            tracks.push(t)
-          }
+          if (!t?.id || seenIds.has(t.id)) continue
+          if (minMs !== null && t.duration_ms < minMs) continue
+          if (maxMs !== null && t.duration_ms > maxMs) continue
+          seenIds.add(t.id)
+          tracks.push(t)
         }
       }
 
-      // 1. Resolve artist names → IDs → top tracks
+      // --- Phase 1: Named artists ---
       const artistNames = params.artistNames ?? []
+      if (artistNames.length) {
+        setLoadingStep(`Finding tracks from ${artistNames.slice(0, 3).join(', ')}…`)
+      }
       await Promise.all(
-        artistNames.slice(0, 6).map(async (name) => {
-          try {
-            const res = await searchArtists(token, name, 1)
-            const artist = res?.artists?.items?.[0]
-            if (!artist) return
-            const top = await getArtistTopTracks(token, artist.id)
-            addTracks((top?.tracks ?? []).slice(0, 4))
-          } catch {}
+        artistNames.slice(0, 8).map(async (name) => {
+          // Use related-artist fallback when we need more tracks (bigger playlist or duration filter active)
+          const needsRelated = targetSize > 20 || minMs !== null || maxMs !== null
+          const collected = await collectArtistTracks(token, name, needsRelated)
+          addTracks(collected)
         })
       )
 
-      // 2. Run search queries for additional variety
+      // --- Phase 2: Search queries ---
       const queries = params.searchQueries ?? []
+      if (queries.length) {
+        setLoadingStep('Searching for matching tracks…')
+      }
+      // Request more tracks per query when we need a big playlist or are filtering by duration
+      const perQuery = Math.ceil((targetSize * 1.5) / Math.max(queries.length, 1))
       await Promise.all(
-        queries.slice(0, 4).map(async (q) => {
+        queries.slice(0, 5).map(async (q) => {
           try {
-            const res = await searchTracks(token, q, 5)
+            const res = await searchTracks(token, q, Math.min(perQuery, 20))
             addTracks(res?.tracks?.items ?? [])
           } catch {}
         })
       )
 
-      if (tracks.length === 0) {
-        throw new Error('No tracks found — try rephrasing your prompt.')
+      // --- Phase 3: Genre fallback if still thin ---
+      if (tracks.length < Math.min(targetSize, 5) && (tasteProfile?.genres?.length ?? 0) > 0) {
+        setLoadingStep('Broadening search…')
+        const fallbackGenre = tasteProfile.genres[0].toLowerCase().replace(/\s+/g, '-')
+        try {
+          const res = await searchTracks(token, `genre:${fallbackGenre}`, 20)
+          addTracks(res?.tracks?.items ?? [])
+        } catch {}
       }
 
-      // Shuffle and cap at 20
-      const shuffled = tracks.sort(() => Math.random() - 0.5).slice(0, 20)
+      if (tracks.length === 0) {
+        setSuggestion(params.emptyResultSuggestion ?? null)
+        throw new Error(
+          `No tracks found for "${text}". ${params.emptyResultSuggestion ? 'See suggestion below.' : 'Try a different prompt.'}`
+        )
+      }
+
+      // Shuffle and cap at targetSize
+      const final = tracks.sort(() => Math.random() - 0.5).slice(0, targetSize)
 
       setPlaylist({
         name: params.playlistName || text,
         description: params.description || '',
-        tracks: shuffled,
+        tracks: final,
+        targetSize,
       })
     } catch (err) {
       setError(err.message || 'Something went wrong. Try a different prompt.')
     } finally {
       setLoading(false)
+      setLoadingStep('')
     }
   }
 
@@ -99,7 +215,6 @@ export default function DiscoverPage() {
     setSaving(true)
     try {
       const token = await getToken()
-      // Ensure we have the user's Spotify ID before creating the playlist
       let userId = spotifyUser?.id
       if (!userId) {
         const me = await getMe(token)
@@ -129,7 +244,6 @@ export default function DiscoverPage() {
         <p className="text-text-secondary">Describe what you want to hear in plain English.</p>
       </div>
 
-      {/* Last.fm import prompt */}
       {!lastfmUsername && <LastfmImport />}
 
       {/* Prompt input */}
@@ -175,20 +289,32 @@ export default function DiscoverPage() {
       {/* Loading state */}
       {loading && (
         <div className="card flex items-center gap-4">
-          <div className="w-10 h-10 rounded-xl bg-accent/10 flex items-center justify-center">
+          <div className="w-10 h-10 rounded-xl bg-accent/10 flex items-center justify-center flex-shrink-0">
             <Loader2 className="w-5 h-5 text-accent animate-spin" />
           </div>
           <div>
             <p className="font-medium">Building your playlist</p>
-            <p className="text-sm text-text-secondary">Claude is translating your vibe into music…</p>
+            <p className="text-sm text-text-secondary">{loadingStep || 'Working on it…'}</p>
           </div>
         </div>
       )}
 
-      {/* Error */}
+      {/* Error + smart suggestion */}
       {error && (
-        <div className="card border-red-500/20 bg-red-500/5">
+        <div className="card border-red-500/20 bg-red-500/5 space-y-3">
           <p className="text-sm text-red-400">{error}</p>
+          {suggestion && (
+            <div className="border-t border-red-500/10 pt-3">
+              <p className="text-xs text-text-muted mb-2">Try this instead:</p>
+              <button
+                onClick={() => { setPrompt(suggestion); generate(suggestion) }}
+                className="text-sm text-accent hover:text-accent-hover flex items-center gap-2 group"
+              >
+                <RefreshCw className="w-3.5 h-3.5 group-hover:rotate-180 transition-transform duration-300" />
+                {suggestion}
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -220,11 +346,7 @@ export default function DiscoverPage() {
                   disabled={saving}
                   className="btn-primary flex items-center gap-2 text-sm"
                 >
-                  {saving ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Save className="w-4 h-4" />
-                  )}
+                  {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
                   Save to Spotify
                 </button>
               )}

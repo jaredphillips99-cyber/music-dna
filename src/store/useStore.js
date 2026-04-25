@@ -39,6 +39,10 @@ const useStore = create(
       setLastfmUsername: (username) => set({ lastfmUsername: username }),
       setLastfmData: (data) => set({ lastfmData: data }),
 
+      // Cached Spotify listening history (top artist names, used to enrich Claude prompts)
+      spotifyTopArtistNames: null,
+      setSpotifyTopArtistNames: (names) => set({ spotifyTopArtistNames: names }),
+
       // Taste profile (from onboarding quiz or imported data)
       tasteProfile: null,
       onboardingComplete: false,
@@ -64,6 +68,7 @@ const useStore = create(
         lastfmUsername: state.lastfmUsername,
         tasteProfile: state.tasteProfile,
         onboardingComplete: state.onboardingComplete,
+        spotifyTopArtistNames: state.spotifyTopArtistNames,
       }),
     }
   )
