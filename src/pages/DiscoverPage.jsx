@@ -8,7 +8,6 @@ import {
   searchArtistStrict,
   searchTracks,
   getArtistTopTracks,
-  getRelatedArtists,
   getTopArtists,
   getMe,
   createPlaylist,
@@ -49,22 +48,70 @@ async function resolveArtist(token, name) {
     const exact =
       strict?.artists?.items?.find((a) => a.name.toLowerCase() === name.toLowerCase()) ??
       strict?.artists?.items?.[0]
-    if (exact) return exact
-  } catch {}
+    if (exact) {
+      LOG(`resolveArtist | "${name}" → ${exact.name} (${exact.id}) genres=[${(exact.genres ?? []).join(', ')}]`)
+      return exact
+    }
+  } catch (e) {
+    LOG(`resolveArtist | strict search failed for "${name}":`, e.message)
+  }
   try {
     const broad = await searchArtists(token, name, 3)
-    return broad?.artists?.items?.[0] ?? null
-  } catch {}
-  return null
+    const found = broad?.artists?.items?.[0] ?? null
+    if (found) LOG(`resolveArtist | "${name}" → broad: ${found.name} (${found.id})`)
+    else LOG(`resolveArtist | "${name}" → no match found`)
+    return found
+  } catch (e) {
+    LOG(`resolveArtist | broad search failed for "${name}":`, e.message)
+    return null
+  }
 }
 
-// Step 1: seed artist → search(artist:"name", 50) + top-tracks union
-async function fetchSeedArtistTracks(token, artistName) {
+// ─── Genre search with fallback ───────────────────────────────────────────────
+// Tries genre: slug filter first; if it returns nothing, falls back to plain keyword.
+// Spotify's genre: filter only works for exact genre slugs it recognises — niche or
+// hyphenated genres (melodic-techno, tech-house) often return 0. The keyword fallback
+// strips hyphens and searches as free text, which reliably returns results.
+
+async function searchGenreTracks(token, genre, limit = 50) {
+  try {
+    const r = await searchTracks(token, `genre:${genre}`, limit)
+    const items = r?.tracks?.items ?? []
+    if (items.length > 0) {
+      LOG(`genre:${genre} → ${items.length} tracks (genre filter)`)
+      return items
+    }
+    LOG(`genre:${genre} → 0 results, trying keyword fallback`)
+  } catch (e) {
+    LOG(`genre:${genre} filter error: ${e.message}`)
+  }
+  // Fallback: plain keyword (strip hyphens)
+  try {
+    const plain = genre.replace(/-/g, ' ')
+    const r = await searchTracks(token, plain, limit)
+    const items = r?.tracks?.items ?? []
+    LOG(`"${plain}" keyword fallback → ${items.length} tracks`)
+    return items
+  } catch (e) {
+    LOG(`genre keyword fallback failed for "${genre}": ${e.message}`)
+    return []
+  }
+}
+
+// ─── Step 1: seed artist tracks ───────────────────────────────────────────────
+
+async function fetchSeedArtistTracks(token, artistName, market) {
   const artist = await resolveArtist(token, artistName)
   const [searchRes, topRes] = await Promise.allSettled([
     searchTracks(token, `artist:"${artistName}"`, 50),
-    artist ? getArtistTopTracks(token, artist.id) : Promise.resolve(null),
+    artist ? getArtistTopTracks(token, artist.id, market) : Promise.resolve(null),
   ])
+
+  if (searchRes.status === 'rejected')
+    LOG(`Step1 | ${artistName} | search error:`, searchRes.reason?.message)
+  if (topRes.status === 'rejected')
+    LOG(`Step1 | ${artistName} | top-tracks error:`, topRes.reason?.message)
+
   const seen = new Set()
   const tracks = []
   for (const t of searchRes.status === 'fulfilled' ? (searchRes.value?.tracks?.items ?? []) : []) {
@@ -73,38 +120,43 @@ async function fetchSeedArtistTracks(token, artistName) {
   for (const t of topRes.status === 'fulfilled' ? (topRes.value?.tracks ?? []) : []) {
     if (t?.id && !seen.has(t.id)) { seen.add(t.id); tracks.push(t) }
   }
-  LOG(`Step1 | ${artistName} | ${tracks.length} tracks (search + top-tracks)`)
-  return { tracks, artistId: artist?.id ?? null, artistName }
+  LOG(`Step1 | ${artistName} | ${tracks.length} tracks (search=${searchRes.status === 'fulfilled' ? searchRes.value?.tracks?.items?.length ?? 0 : 'ERR'}, top-tracks=${topRes.status === 'fulfilled' ? topRes.value?.tracks?.length ?? 0 : 'ERR'})`)
+  return { tracks, artistId: artist?.id ?? null, artistName, artistGenres: artist?.genres ?? [] }
 }
 
-// Step 2: for each seed, get top 5 related artists → their top-tracks
-async function fetchRelatedTracks(token, artistId, artistName) {
-  if (!artistId) return []
-  let relArtists = []
-  try {
-    const res = await getRelatedArtists(token, artistId)
-    relArtists = (res?.artists ?? []).slice(0, 5)
-    LOG(`Step2 | ${artistName} | related: ${relArtists.map((a) => a.name).join(', ')}`)
-  } catch (e) {
-    LOG(`Step2 | ${artistName} | related-artists failed:`, e.message)
-    return []
-  }
+// ─── Step 2: genre-based expansion ───────────────────────────────────────────
+// Replaces /artists/{id}/related-artists which is 403-restricted for new Spotify apps
+// since Nov 2024. Instead uses the seed artist's own Spotify genre tags (guaranteed
+// valid genre slugs) to discover tracks by other artists in the same space.
+
+async function fetchGenreExpansionTracks(token, artistName, artistGenres, claudeGenres) {
+  // Convert artist's Spotify genre strings ("melodic techno") → slugs ("melodic-techno")
+  const spotifyGenres = artistGenres.slice(0, 3).map((g) => g.replace(/\s+/g, '-'))
+  const genresToUse = spotifyGenres.length ? spotifyGenres : claudeGenres.slice(0, 3)
+
+  LOG(`Step2 | ${artistName} | expanding via genres: [${genresToUse.join(', ')}] (related-artists restricted)`)
+
   const results = await Promise.allSettled(
-    relArtists.map((ra) =>
-      getArtistTopTracks(token, ra.id).then((r) => ({ name: ra.name, tracks: r?.tracks ?? [] }))
-    )
+    genresToUse.map((g) => searchGenreTracks(token, g, 50))
   )
+
+  const seen = new Set()
   const tracks = []
   for (const r of results) {
     if (r.status === 'fulfilled') {
-      LOG(`Step2 | related ${r.value.name} | ${r.value.tracks.length} tracks`)
-      tracks.push(...r.value.tracks)
+      for (const t of r.value) {
+        if (t?.id && !seen.has(t.id)) { seen.add(t.id); tracks.push(t) }
+      }
+    } else {
+      LOG(`Step2 | ${artistName} | genre search rejected:`, r.reason?.message)
     }
   }
+  LOG(`Step2 | ${artistName} | genre expansion → ${tracks.length} tracks`)
   return tracks
 }
 
-// Energy arc: low → peak (middle) → low using popularity as proxy
+// ─── Energy arc ───────────────────────────────────────────────────────────────
+
 function arrangeEnergyArc(tracks) {
   if (tracks.length <= 3) return tracks
   const sorted = [...tracks].sort((a, b) => (b.popularity ?? 50) - (a.popularity ?? 50))
@@ -136,7 +188,6 @@ function DebugPanel({ params, stages }) {
 
       {open && (
         <div className="p-4 bg-surface-1 space-y-5 text-xs font-mono">
-          {/* Parsed params */}
           <div>
             <p className="text-text-muted uppercase tracking-widest mb-2">Parsed by Claude</p>
             <div className="grid grid-cols-2 gap-x-6 gap-y-1.5">
@@ -151,7 +202,6 @@ function DebugPanel({ params, stages }) {
             </div>
           </div>
 
-          {/* Pipeline stages */}
           {stages.length > 0 && (
             <div>
               <p className="text-text-muted uppercase tracking-widest mb-2">Pipeline stages</p>
@@ -191,13 +241,13 @@ export default function DiscoverPage() {
   } = useStore()
   const { getToken } = useSpotify()
 
-  const [prompt, setPrompt]         = useState('')
-  const [loading, setLoading]       = useState(false)
+  const [prompt, setPrompt]           = useState('')
+  const [loading, setLoading]         = useState(false)
   const [loadingStep, setLoadingStep] = useState('')
-  const [saving, setSaving]         = useState(false)
-  const [playlist, setPlaylist]     = useState(null)
-  const [error, setError]           = useState(null)
-  const [savedUrl, setSavedUrl]     = useState(null)
+  const [saving, setSaving]           = useState(false)
+  const [playlist, setPlaylist]       = useState(null)
+  const [error, setError]             = useState(null)
+  const [savedUrl, setSavedUrl]       = useState(null)
   const [debugParams, setDebugParams] = useState(null)
   const [debugStages, setDebugStages] = useState([])
 
@@ -208,7 +258,10 @@ export default function DiscoverPage() {
       const names = (data?.items ?? []).map((a) => a.name).filter(Boolean)
       if (names.length) setSpotifyTopArtistNames(names)
       return names
-    } catch { return [] }
+    } catch (e) {
+      LOG('ensureSpotifyHistory failed:', e.message)
+      return []
+    }
   }
 
   async function generate(text) {
@@ -229,7 +282,15 @@ export default function DiscoverPage() {
 
     try {
       const token = await getToken()
-      if (!token) throw new Error('Not authenticated')
+      if (!token) throw new Error('Not authenticated — please reconnect Spotify')
+
+      // Token diagnostics — logs token prefix and expiry to the console
+      const { spotifyTokenExpiry } = useStore.getState()
+      LOG(`Token OK: ${token.slice(0, 8)}… expires in ${Math.round((spotifyTokenExpiry - Date.now()) / 1000)}s`)
+
+      // User market for top-tracks API (requires explicit ISO country code since from_token is deprecated)
+      const market = spotifyUser?.country || 'US'
+      LOG(`Using market: ${market}`)
 
       // ── Step 0: Parse prompt with Claude ─────────────────────────────────
       const topArtistNames = await ensureSpotifyHistory(token)
@@ -239,14 +300,22 @@ export default function DiscoverPage() {
       LOG('Claude parsed params:', JSON.stringify(params, null, 2))
       setDebugParams(params)
 
-      // Normalise field names (Claude returns the exact spec schema now)
-      const artists      = params.artists ?? []
-      const genres       = params.genres ?? []
-      const trackCount   = Math.min(Math.max(params.track_count ?? 20, 1), 50)
-      const minMs        = params.duration_min_ms ?? null
-      const isSingle     = params.isSingleArtistPlaylist === true
+      if (params.raw) {
+        LOG('WARNING: Claude returned non-JSON (raw field set). Response:', params.raw)
+        throw new Error('Claude returned an unexpected response format. Please try again.')
+      }
 
-      LOG(`artists=[${artists.join(', ')}] genres=[${genres.join(', ')}] count=${trackCount} minMs=${minMs}`)
+      const artists    = params.artists ?? []
+      const genres     = params.genres ?? []
+      const trackCount = Math.min(Math.max(params.track_count ?? 20, 1), 50)
+      const minMs      = params.duration_min_ms ?? null
+      const isSingle   = params.isSingleArtistPlaylist === true
+
+      LOG(`artists=[${artists.join(', ')}] genres=[${genres.join(', ')}] count=${trackCount} minMs=${minMs} isSingle=${isSingle}`)
+
+      if (artists.length === 0 && genres.length === 0) {
+        throw new Error('Claude could not identify any artists or genres from your prompt. Try being more specific.')
+      }
 
       // Raw pool — dedup by track ID only, no filtering yet
       const rawPool = new Map()
@@ -259,24 +328,26 @@ export default function DiscoverPage() {
 
       const seedResults = await Promise.all(
         artists.slice(0, 10).map((name) =>
-          fetchSeedArtistTracks(token, name).catch((e) => {
-            LOG(`Step1 | ${name} | error:`, e.message)
-            return { tracks: [], artistId: null, artistName: name }
+          fetchSeedArtistTracks(token, name, market).catch((e) => {
+            LOG(`Step1 | ${name} | unhandled error:`, e.message)
+            return { tracks: [], artistId: null, artistName: name, artistGenres: [] }
           })
         )
       )
       for (const { tracks } of seedResults) pool(tracks)
       stage('Step 1 — seed artist tracks', rawPool.size)
 
-      // ── Step 2: Related artist expansion (top 5 related per seed) ─────────
-      setLoadingStep('Expanding with related artists…')
-      const relatedArrays = await Promise.all(
+      // ── Step 2: Genre-based expansion (replaces restricted related-artists) ─
+      setLoadingStep('Expanding with similar genre tracks…')
+      const expansionArrays = await Promise.all(
         seedResults
-          .filter((r) => r.artistId)
-          .map((r) => fetchRelatedTracks(token, r.artistId, r.artistName).catch(() => []))
+          .filter((r) => r.artistId) // only artists we successfully resolved
+          .map((r) =>
+            fetchGenreExpansionTracks(token, r.artistName, r.artistGenres, genres).catch(() => [])
+          )
       )
-      for (const tracks of relatedArrays) pool(tracks)
-      stage('Step 2 — related artist expansion', rawPool.size)
+      for (const tracks of expansionArrays) pool(tracks)
+      stage('Step 2 — genre expansion (related-artists replaced)', rawPool.size)
 
       // ── Step 3: Last.fm top artists ───────────────────────────────────────
       const lfmNames = (lastfmData?.topArtists ?? [])
@@ -289,26 +360,32 @@ export default function DiscoverPage() {
             try {
               const artist = await resolveArtist(token, name)
               if (!artist) return []
-              const res = await getArtistTopTracks(token, artist.id)
+              const res = await getArtistTopTracks(token, artist.id, market)
               return res?.tracks ?? []
-            } catch { return [] }
+            } catch (e) {
+              LOG(`Step3 | Last.fm artist "${name}" error:`, e.message)
+              return []
+            }
           })
         )
         for (const tracks of lfmTracks) pool(tracks)
         stage('Step 3 — Last.fm artist tracks', rawPool.size)
       }
 
-      // ── Step 4: Genre searches (limit=50 each) ────────────────────────────
+      // ── Step 4: Genre searches (genre: filter + keyword fallback) ─────────
       setLoadingStep('Searching by genre…')
       const genreResults = await Promise.all(
         genres.slice(0, 4).map((g) =>
-          searchTracks(token, `genre:${g}`, 50)
-            .then((r) => { const items = r?.tracks?.items ?? []; LOG(`genre:${g} → ${items.length}`); return items })
-            .catch(() => [])
+          searchGenreTracks(token, g, 50).catch((e) => {
+            LOG(`Step4 | genre "${g}" error:`, e.message)
+            return []
+          })
         )
       )
       for (const tracks of genreResults) pool(tracks)
       stage('Step 4 — genre searches', rawPool.size)
+
+      LOG(`Raw pool after all sources: ${rawPool.size} unique tracks`)
 
       // ── Step 5: Duration filter + diversity cap ───────────────────────────
       let filtered = Array.from(rawPool.values())
@@ -317,7 +394,7 @@ export default function DiscoverPage() {
         stage(`Step 5a — duration filter (≥${Math.round(minMs / 60000)}min)`, filtered.length)
       }
 
-      filtered.sort(() => Math.random() - 0.5) // shuffle before cap
+      filtered.sort(() => Math.random() - 0.5)
 
       let capped
       if (isSingle) {
@@ -341,7 +418,7 @@ export default function DiscoverPage() {
 
         const absorb = (items) => {
           for (const t of items) {
-            if (capped.length >= trackCount * 2) break // collect 2× target so shuffle has room
+            if (capped.length >= trackCount * 2) break
             if (!t?.id || cappedIds.has(t.id)) continue
             if (minMs !== null && t.duration_ms < minMs) continue
             if (!isSingle) {
@@ -357,15 +434,13 @@ export default function DiscoverPage() {
           }
         }
 
-        // Layer 1: specific genre:slug searches
+        // Layer 1: specific genre searches
         setLoadingStep('Backfilling with genre searches…')
         for (const g of genres) {
           if (capped.length >= trackCount) break
-          try {
-            const r = await searchTracks(token, `genre:${g}`, 50)
-            absorb(r?.tracks?.items ?? [])
-            stage(`Backfill L1 — genre:${g}`, capped.length)
-          } catch {}
+          const r = await searchGenreTracks(token, g, 50).catch(() => [])
+          absorb(r)
+          stage(`Backfill L1 — genre:${g}`, capped.length)
         }
 
         // Layer 2: broader genre fallbacks
@@ -377,11 +452,9 @@ export default function DiscoverPage() {
 
           for (const g of broader) {
             if (capped.length >= trackCount) break
-            try {
-              const r = await searchTracks(token, `genre:${g}`, 50)
-              absorb(r?.tracks?.items ?? [])
-              stage(`Backfill L2 — genre:${g} (broader)`, capped.length)
-            } catch {}
+            const r = await searchGenreTracks(token, g, 50).catch(() => [])
+            absorb(r)
+            stage(`Backfill L2 — ${g} (broader)`, capped.length)
           }
         }
 
@@ -392,11 +465,12 @@ export default function DiscoverPage() {
             const r = await searchTracks(token, params.mood, 50)
             absorb(r?.tracks?.items ?? [])
             stage(`Backfill L3 — mood "${params.mood}"`, capped.length)
-          } catch {}
+          } catch (e) {
+            LOG(`Backfill L3 mood error: ${e.message}`)
+          }
         }
       }
 
-      // Only surface an error if ALL three layers were exhausted and we still have nothing
       if (capped.length === 0) {
         throw new Error(
           `Couldn't find any tracks for that prompt — even after broadening the search. ` +
@@ -419,6 +493,7 @@ export default function DiscoverPage() {
         tracks: final,
       })
     } catch (err) {
+      LOG('generate() error:', err.message)
       setDebugStages([...stages])
       setError(err.message || 'Something went wrong. Try a different prompt.')
     } finally {
@@ -514,7 +589,6 @@ export default function DiscoverPage() {
           <div className="card border-red-500/20 bg-red-500/5">
             <p className="text-sm text-red-400">{error}</p>
           </div>
-          {/* Still show debug panel on error so the user can see what failed */}
           <DebugPanel params={debugParams} stages={debugStages} />
         </div>
       )}
@@ -553,7 +627,6 @@ export default function DiscoverPage() {
             ))}
           </div>
 
-          {/* Debug panel — collapsible, shown below the tracklist */}
           <DebugPanel params={debugParams} stages={debugStages} />
         </div>
       )}

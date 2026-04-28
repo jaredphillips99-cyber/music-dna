@@ -89,8 +89,8 @@ export const searchArtistStrict = (token, name, limit = 3) =>
 export const searchTracks = (token, query, limit = 5) =>
   spotifyFetch(`/search?q=${encodeURIComponent(query)}&type=track&limit=${limit}`, token)
 
-export const getArtistTopTracks = (token, artistId) =>
-  spotifyFetch(`/artists/${artistId}/top-tracks?market=from_token`, token)
+export const getArtistTopTracks = (token, artistId, market = 'US') =>
+  spotifyFetch(`/artists/${artistId}/top-tracks?market=${market}`, token)
 
 export const getRelatedArtists = (token, artistId) =>
   spotifyFetch(`/artists/${artistId}/related-artists`, token)
