@@ -20,7 +20,7 @@ export default async function handler(req, res) {
   }
 
   const systemPrompts = {
-    playlist: `You are a music playlist assistant. Extract the following from the user's prompt and return ONLY a JSON object with no other text:
+    playlist: `You are a music playlist assistant. Extract the following from the user's prompt and return ONLY a raw JSON object. No markdown. No code fences. No backticks. No preamble. Start your response with { and end with }.
 
 {
   "artists": [],
@@ -45,7 +45,7 @@ Field rules:
 - mood: 1-3 word mood string e.g. "euphoric", "dark and driving", "warm and nostalgic".
 - playlistName: creative, evocative name (3-6 words).
 - description: 1-2 sentence evocative description of the vibe.
-- isSingleArtistPlaylist: true ONLY when user explicitly asks for one specific artist ("only Chris Stussy", "give me a Bicep playlist"). False in all other cases.``,
+- isSingleArtistPlaylist: true ONLY when user explicitly asks for one specific artist ("only Chris Stussy", "give me a Bicep playlist"). False in all other cases.`,
 
     discovery: `You are a music taste analyst. Given a user's taste profile, generate 3 insightful observations about their listening personality in a JSON array of strings. Each insight should be specific, flattering, and interesting — like something a knowledgeable music-loving friend would say. Max 2 sentences each.
 
@@ -107,21 +107,25 @@ Respond with valid JSON only: { "insights": ["insight1", "insight2", "insight3"]
     const data = await response.json()
 
     if (!response.ok) {
+      console.error('Claude API HTTP error:', response.status, JSON.stringify(data))
       return res.status(response.status).json({ error: data.error?.message || 'Claude API error' })
     }
 
-    const text = data.content?.[0]?.text || '{}'
+    const rawText = data.content?.[0]?.text || '{}'
+    const text = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim()
     let parsed
     try {
       parsed = JSON.parse(text)
-    } catch {
+    } catch (parseErr) {
+      console.error('Claude JSON parse error:', parseErr.message)
+      console.error('Raw Claude response text:', rawText)
       parsed = { raw: text }
     }
 
     res.setHeader('Access-Control-Allow-Origin', '*')
     return res.status(200).json(parsed)
   } catch (err) {
-    console.error('Claude API error:', err)
+    console.error('Claude API error:', err.message, err.stack)
     return res.status(500).json({ error: 'Internal server error' })
   }
 }
