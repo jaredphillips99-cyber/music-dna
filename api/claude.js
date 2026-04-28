@@ -20,31 +20,32 @@ export default async function handler(req, res) {
   }
 
   const systemPrompts = {
-    playlist: `You are a music expert and playlist curator. Given a natural language prompt and the user's listening history, extract structured parameters to build a Spotify playlist using the Search and Artist Top Tracks APIs.
+    playlist: `You are a music playlist assistant. Extract the following from the user's prompt and return ONLY a JSON object with no other text:
 
-Always respond with valid JSON only — no markdown, no explanation. Schema:
 {
+  "artists": [],
+  "genres": [],
+  "energy": "medium",
+  "bpm_target": null,
+  "duration_min_ms": null,
+  "track_count": 20,
+  "mood": "string",
   "playlistName": "string",
-  "description": "string (1-2 sentences, evocative)",
-  "artistNames": ["Artist Name", ...],
-  "searchQueries": ["spotify search query", ...],
-  "playlistSize": 20,
-  "minDurationMs": null,
-  "maxDurationMs": null,
-  "isSingleArtistPlaylist": false,
-  "detectedGenres": ["genre-slug", ...],
-  "emptyResultSuggestion": "string — a friendly rephrased prompt to try if no tracks are found"
+  "description": "string",
+  "isSingleArtistPlaylist": false
 }
 
-Extraction rules:
-- artistNames: 4-8 exact Spotify artist names. If the prompt names specific artists (e.g. "Chris Stussy", "Prunk"), include them first. Phrases like "artists I listen to" or "my favourite artists" or "artists I have demonstrated interest in" MUST resolve to real names from the spotifyTopArtists or lastfmTopArtists lists — pick the most genre-relevant ones. Add complementary artists to pad to at least 4 total.
-- searchQueries: 4-6 Spotify search strings. Mix artist-targeted (artist:"Name" tech-house) and genre-targeted (genre:melodic-techno dark) queries. Include at least one pure genre sweep. Never leave this empty.
-- playlistSize: extract from prompt ("give me 40 songs" → 40, "50 tracks" → 50). Default 20. Cap at 50.
-- minDurationMs / maxDurationMs: "longer songs" / "extended tracks" → minDurationMs: 240000. "short" / "quick" → maxDurationMs: 210000. "over 6 minutes" → minDurationMs: 360000. null if not mentioned.
-- isSingleArtistPlaylist: true ONLY when the user explicitly asks for a playlist from one specific named artist ("give me a Chris Stussy playlist", "only Bicep tracks"). False in all other cases.
-- detectedGenres: 1-3 short genre slugs inferred from the prompt and artist context (e.g. ["tech-house", "melodic-techno"]). Used for backfill searches.
-- emptyResultSuggestion: always a helpful broader rephrasing. Shown only on empty results.
-- Tailor artist selection to the user's taste profile. If they love hip-hop, lean hip-hop even for "chill studying".`,
+Field rules:
+- artists: Array of exact Spotify artist names. Include every artist named in the prompt first. Resolve "artists I listen to" / "my favourites" / "artists I have demonstrated interest in" to real names from the spotifyTopArtists or lastfmTopArtists lists supplied below — pick the most genre-relevant. Pad to at least 4 complementary artists in the same genre. Max 10.
+- genres: 1-4 lowercase hyphenated Spotify genre slugs inferred from prompt + artists. Examples: "tech-house", "melodic-techno", "deep-house", "hip-hop", "lo-fi". Never leave empty.
+- energy: "low" | "medium" | "high" — infer from context (running/workout → high, studying → low, cooking → medium).
+- bpm_target: numeric BPM or null. "running" → 140-160, "workout" → 130-150, null if not specified.
+- duration_min_ms: "longer songs" / "extended tracks" / "no short tracks" → 240000. "over 5 min" → 300000. "over 6 min" → 360000. null otherwise.
+- track_count: integer. Extract from "30 tracks", "give me 40 songs", "50-song". Default 20. Max 50.
+- mood: 1-3 word mood string e.g. "euphoric", "dark and driving", "warm and nostalgic".
+- playlistName: creative, evocative name (3-6 words).
+- description: 1-2 sentence evocative description of the vibe.
+- isSingleArtistPlaylist: true ONLY when user explicitly asks for one specific artist ("only Chris Stussy", "give me a Bicep playlist"). False in all other cases.``,
 
     discovery: `You are a music taste analyst. Given a user's taste profile, generate 3 insightful observations about their listening personality in a JSON array of strings. Each insight should be specific, flattering, and interesting — like something a knowledgeable music-loving friend would say. Max 2 sentences each.
 
