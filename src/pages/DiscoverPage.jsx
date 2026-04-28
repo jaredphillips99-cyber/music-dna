@@ -25,14 +25,16 @@ const EXAMPLE_PROMPTS = [
   'Focus music with no lyrics for deep work',
 ]
 
-// Resolve an artist name → Spotify artist object.
-// Tries strict artist:"Name" first, falls back to plain search.
+const LOG = (...args) => console.log('[MusicDNA]', ...args)
+
+// ─── Artist resolution ────────────────────────────────────────────────────────
+
 async function resolveArtist(token, name) {
   try {
     const strict = await searchArtistStrict(token, name, 3)
-    const exact = strict?.artists?.items?.find(
-      (a) => a.name.toLowerCase() === name.toLowerCase()
-    ) ?? strict?.artists?.items?.[0]
+    const exact =
+      strict?.artists?.items?.find((a) => a.name.toLowerCase() === name.toLowerCase()) ??
+      strict?.artists?.items?.[0]
     if (exact) return exact
   } catch {}
   try {
@@ -42,73 +44,106 @@ async function resolveArtist(token, name) {
   return null
 }
 
-// Fetch an artist's top tracks + top tracks from their top N related artists, all in parallel.
-async function expandArtist(token, artistName, relatedCount = 4) {
-  const artist = await resolveArtist(token, artistName)
-  if (!artist) return { tracks: [], artistId: null }
+// ─── Step 1: Seed artist tracks ───────────────────────────────────────────────
+// Uses search (limit=50) + top-tracks union — gets far more than the 10-track
+// top-tracks endpoint alone.
 
-  // Kick off top-tracks and related-artists fetch simultaneously
-  const [topResult, relatedResult] = await Promise.allSettled([
-    getArtistTopTracks(token, artist.id),
-    getRelatedArtists(token, artist.id),
+async function fetchSeedArtistTracks(token, artistName) {
+  const artist = await resolveArtist(token, artistName)
+
+  const [searchRes, topRes] = await Promise.allSettled([
+    searchTracks(token, `artist:"${artistName}"`, 50),
+    artist ? getArtistTopTracks(token, artist.id) : Promise.resolve(null),
   ])
 
-  const tracks = topResult.status === 'fulfilled' ? (topResult.value?.tracks ?? []) : []
+  const seen = new Set()
+  const tracks = []
 
-  if (relatedResult.status === 'fulfilled') {
-    const relArtists = (relatedResult.value?.artists ?? []).slice(0, relatedCount)
-    const relTrackResults = await Promise.allSettled(
-      relArtists.map((ra) => getArtistTopTracks(token, ra.id))
-    )
-    for (const r of relTrackResults) {
-      if (r.status === 'fulfilled') tracks.push(...(r.value?.tracks ?? []).slice(0, 3))
-    }
+  const searchItems = searchRes.status === 'fulfilled' ? (searchRes.value?.tracks?.items ?? []) : []
+  LOG(`Step1 | ${artistName} | search returned ${searchItems.length} tracks`)
+  for (const t of searchItems) {
+    if (t?.id && !seen.has(t.id)) { seen.add(t.id); tracks.push(t) }
   }
 
-  return { tracks, artistId: artist.id }
+  const topItems = topRes.status === 'fulfilled' ? (topRes.value?.tracks ?? []) : []
+  LOG(`Step1 | ${artistName} | top-tracks returned ${topItems.length} tracks`)
+  for (const t of topItems) {
+    if (t?.id && !seen.has(t.id)) { seen.add(t.id); tracks.push(t) }
+  }
+
+  LOG(`Step1 | ${artistName} | unique total: ${tracks.length}`)
+  return { tracks, artistId: artist?.id ?? null, artistName }
 }
 
-// Arrange tracks in an energy arc: low → high (middle) → low.
-// Uses popularity as a proxy for energy since audio features are unavailable.
+// ─── Step 2: Related artist expansion ────────────────────────────────────────
+
+async function fetchRelatedTracks(token, artistId, artistName, count = 5) {
+  if (!artistId) return []
+  let relArtists = []
+  try {
+    const res = await getRelatedArtists(token, artistId)
+    relArtists = (res?.artists ?? []).slice(0, count)
+    LOG(`Step2 | ${artistName} | related artists: ${relArtists.map((a) => a.name).join(', ')}`)
+  } catch (e) {
+    LOG(`Step2 | ${artistName} | related-artists call failed:`, e.message)
+    return []
+  }
+
+  const results = await Promise.allSettled(
+    relArtists.map((ra) =>
+      getArtistTopTracks(token, ra.id)
+        .then((r) => ({ name: ra.name, tracks: r?.tracks ?? [] }))
+    )
+  )
+
+  const tracks = []
+  for (const r of results) {
+    if (r.status === 'fulfilled') {
+      LOG(`Step2 | related ${r.value.name} | ${r.value.tracks.length} tracks`)
+      tracks.push(...r.value.tracks)
+    } else {
+      LOG(`Step2 | a related artist call was rejected`)
+    }
+  }
+  LOG(`Step2 | ${artistName} | total related tracks: ${tracks.length}`)
+  return tracks
+}
+
+// ─── Energy arc ordering ──────────────────────────────────────────────────────
+// Uses popularity as proxy for energy (audio features endpoint is deprecated).
+// Produces: low → peak (middle) → low shape.
+
 function arrangeEnergyArc(tracks) {
   if (tracks.length <= 3) return tracks
   const sorted = [...tracks].sort((a, b) => (b.popularity ?? 50) - (a.popularity ?? 50))
   const n = sorted.length
   const arc = new Array(n)
-  // Place tracks from highest popularity outward from the middle
   let lo = Math.floor(n / 2) - 1
   let hi = Math.floor(n / 2)
   for (let i = 0; i < n; i++) {
-    if (i % 2 === 0) {
-      arc[hi] = sorted[i]
-      hi = Math.min(hi + 1, n - 1)
-    } else {
-      arc[lo] = sorted[i]
-      lo = Math.max(lo - 1, 0)
-    }
+    if (i % 2 === 0) { arc[hi] = sorted[i]; hi = Math.min(hi + 1, n - 1) }
+    else             { arc[lo] = sorted[i]; lo = Math.max(lo - 1, 0) }
   }
   return arc.filter(Boolean)
 }
 
+// ─── Component ────────────────────────────────────────────────────────────────
+
 export default function DiscoverPage() {
   const {
-    tasteProfile,
-    spotifyUser,
-    lastfmData,
-    lastfmUsername,
-    spotifyTopArtistNames,
-    setSpotifyTopArtistNames,
+    tasteProfile, spotifyUser, lastfmData, lastfmUsername,
+    spotifyTopArtistNames, setSpotifyTopArtistNames,
   } = useStore()
   const { getToken } = useSpotify()
 
-  const [prompt, setPrompt] = useState('')
-  const [loading, setLoading] = useState(false)
+  const [prompt, setPrompt]       = useState('')
+  const [loading, setLoading]     = useState(false)
   const [loadingStep, setLoadingStep] = useState('')
-  const [saving, setSaving] = useState(false)
-  const [playlist, setPlaylist] = useState(null)
-  const [error, setError] = useState(null)
+  const [saving, setSaving]       = useState(false)
+  const [playlist, setPlaylist]   = useState(null)
+  const [error, setError]         = useState(null)
   const [suggestion, setSuggestion] = useState(null)
-  const [savedUrl, setSavedUrl] = useState(null)
+  const [savedUrl, setSavedUrl]   = useState(null)
 
   async function ensureSpotifyHistory(token) {
     if (spotifyTopArtistNames?.length) return spotifyTopArtistNames
@@ -117,9 +152,7 @@ export default function DiscoverPage() {
       const names = (data?.items ?? []).map((a) => a.name).filter(Boolean)
       if (names.length) setSpotifyTopArtistNames(names)
       return names
-    } catch {
-      return []
-    }
+    } catch { return [] }
   }
 
   async function generate(text) {
@@ -139,129 +172,213 @@ export default function DiscoverPage() {
       const profile = { ...tasteProfile, lastfmUsername, lastfmData, spotifyTopArtistNames: topArtistNames }
       const params = await getPlaylistParams(text, profile)
 
-      const targetSize = Math.min(Math.max(params.playlistSize ?? 20, 1), 50)
-      const minMs = params.minDurationMs ?? null
-      const maxMs = params.maxDurationMs ?? null
+      LOG('Claude params:', JSON.stringify(params, null, 2))
+
+      const targetSize   = Math.min(Math.max(params.playlistSize ?? 20, 1), 50)
+      const minMs        = params.minDurationMs ?? null
+      const maxMs        = params.maxDurationMs ?? null
       const isSingleArtist = params.isSingleArtistPlaylist === true
       const detectedGenres = params.detectedGenres ?? []
+      const artistNames  = params.artistNames ?? []
+      const queries      = params.searchQueries ?? []
 
-      // Track per-artist counts for diversity cap (3 tracks max per artist unless single-artist mode)
-      const artistTrackCount = new Map()
-      const seenIds = new Set()
-      const tracks = []
+      LOG(`Target: ${targetSize} tracks | minMs: ${minMs} | maxMs: ${maxMs} | singleArtist: ${isSingleArtist}`)
+      LOG(`Seed artists: ${artistNames.join(', ')}`)
+      LOG(`Search queries: ${queries.join(' | ')}`)
+      LOG(`Detected genres: ${detectedGenres.join(', ')}`)
 
-      function addTracks(items, { sourceArtistId = null, skipCap = false } = {}) {
+      // ── Raw pool: Map<trackId, track> — no filtering yet ──────────────────
+      const rawPool = new Map()
+      const addToPool = (items) => {
         for (const t of items) {
-          if (!t?.id || seenIds.has(t.id)) continue
-          if (minMs !== null && t.duration_ms < minMs) continue
-          if (maxMs !== null && t.duration_ms > maxMs) continue
-
-          // Diversity cap: max 3 tracks per artist unless single-artist or explicitly skipped
-          if (!isSingleArtist && !skipCap) {
-            const artistId = sourceArtistId ?? t.artists?.[0]?.id
-            if (artistId) {
-              const count = artistTrackCount.get(artistId) ?? 0
-              if (count >= 3) continue
-              artistTrackCount.set(artistId, count + 1)
-            }
-          }
-
-          seenIds.add(t.id)
-          tracks.push(t)
+          if (t?.id && !rawPool.has(t.id)) rawPool.set(t.id, t)
         }
       }
 
-      // ── Phase 1: Named seed artists — all in parallel, each with related-artist expansion ──
-      const artistNames = params.artistNames ?? []
+      // ── STEP 1: All seed artists in parallel (search limit=50 + top-tracks) ──
       if (artistNames.length) {
-        setLoadingStep(`Expanding ${artistNames.length} artists + their related artists…`)
+        setLoadingStep(`Fetching tracks for ${artistNames.slice(0, 3).join(', ')}${artistNames.length > 3 ? '…' : ''}`)
       }
-
-      // Single-artist mode: pull full top-tracks from the one seed (no related cap) to fill size
-      if (isSingleArtist && artistNames.length >= 1) {
-        const { tracks: seedTracks, artistId } = await expandArtist(token, artistNames[0], 5)
-        addTracks(seedTracks, { sourceArtistId: artistId, skipCap: true })
-      } else {
-        const expansions = await Promise.all(
-          artistNames.slice(0, 8).map((name) => expandArtist(token, name, 4))
+      const seedResults = await Promise.all(
+        artistNames.slice(0, 8).map((name) =>
+          fetchSeedArtistTracks(token, name).catch((e) => {
+            LOG(`Step1 | ${name} | top-level error:`, e.message)
+            return { tracks: [], artistId: null, artistName: name }
+          })
         )
-        for (const { tracks: t, artistId } of expansions) {
-          addTracks(t, { sourceArtistId: artistId })
-        }
-      }
+      )
+      for (const { tracks } of seedResults) addToPool(tracks)
+      LOG(`After Step 1 (seed artists): raw pool = ${rawPool.size} tracks`)
 
-      // ── Phase 2: Last.fm top artists as additional seeds (if connected) ──
-      const lfmArtists = (lastfmData?.topArtists ?? [])
-        .slice(0, 8)
+      // ── STEP 2: Related artists for every seed (top 5 related, limit=10 each) ──
+      setLoadingStep('Expanding with related artists…')
+      const relatedArrays = await Promise.all(
+        seedResults
+          .filter((r) => r.artistId)
+          .map((r) =>
+            fetchRelatedTracks(token, r.artistId, r.artistName, 5).catch(() => [])
+          )
+      )
+      for (const tracks of relatedArrays) addToPool(tracks)
+      LOG(`After Step 2 (related artists): raw pool = ${rawPool.size} tracks`)
+
+      // ── STEP 3: Last.fm top artists as seeds ──────────────────────────────
+      const lfmArtistNames = (lastfmData?.topArtists ?? [])
         .map((a) => a.name)
         .filter((n) => n && !artistNames.includes(n))
+        .slice(0, 6)
 
-      if (lfmArtists.length) {
+      if (lfmArtistNames.length) {
         setLoadingStep('Adding tracks from your Last.fm history…')
-        const lfmExpansions = await Promise.all(
-          lfmArtists.slice(0, 5).map((name) => expandArtist(token, name, 2))
+        LOG(`Step3 | Last.fm artists: ${lfmArtistNames.join(', ')}`)
+        const lfmResults = await Promise.all(
+          lfmArtistNames.map(async (name) => {
+            try {
+              const artist = await resolveArtist(token, name)
+              if (!artist) { LOG(`Step3 | ${name} | not found on Spotify`); return [] }
+              const res = await getArtistTopTracks(token, artist.id)
+              const tracks = res?.tracks ?? []
+              LOG(`Step3 | ${name} | ${tracks.length} top tracks`)
+              return tracks
+            } catch (e) {
+              LOG(`Step3 | ${name} | error:`, e.message)
+              return []
+            }
+          })
         )
-        for (const { tracks: t, artistId } of lfmExpansions) {
-          addTracks(t, { sourceArtistId: artistId })
-        }
+        for (const tracks of lfmResults) addToPool(tracks)
+        LOG(`After Step 3 (Last.fm): raw pool = ${rawPool.size} tracks`)
       }
 
-      // ── Phase 3: Search queries ──
-      const queries = params.searchQueries ?? []
-      if (queries.length) {
-        setLoadingStep('Searching for matching tracks…')
-      }
-      const perQuery = Math.min(Math.ceil((targetSize * 2) / Math.max(queries.length, 1)), 50)
-      await Promise.all(
-        queries.slice(0, 6).map(async (q) => {
-          try {
-            const res = await searchTracks(token, q, perQuery)
-            addTracks(res?.tracks?.items ?? [])
-          } catch {}
-        })
+      // ── STEP 4: Search queries (always limit=50) ──────────────────────────
+      setLoadingStep('Searching for matching tracks…')
+      const queryResults = await Promise.all(
+        queries.slice(0, 6).map((q) =>
+          searchTracks(token, q, 50)
+            .then((r) => {
+              const items = r?.tracks?.items ?? []
+              LOG(`Step4 | query "${q}" | ${items.length} results`)
+              return items
+            })
+            .catch((e) => {
+              LOG(`Step4 | query "${q}" | error:`, e.message)
+              return []
+            })
+        )
       )
+      for (const tracks of queryResults) addToPool(tracks)
+      LOG(`After Step 4 (search queries): raw pool = ${rawPool.size} tracks`)
 
-      // ── Phase 4: Backfill with genre searches until targetSize is reached ──
-      if (tracks.length < targetSize) {
+      // ── STEP 5: Apply duration filter then artist diversity cap ───────────
+      let filtered = Array.from(rawPool.values())
+
+      if (minMs !== null) {
+        const before = filtered.length
+        filtered = filtered.filter((t) => t.duration_ms >= minMs)
+        LOG(`Duration filter (>=${minMs}ms): ${before} → ${filtered.length} tracks`)
+      }
+      if (maxMs !== null) {
+        const before = filtered.length
+        filtered = filtered.filter((t) => t.duration_ms <= maxMs)
+        LOG(`Duration filter (<=${maxMs}ms): ${before} → ${filtered.length} tracks`)
+      }
+
+      // Shuffle before capping so the 3 we keep per artist are random, not always the same
+      filtered.sort(() => Math.random() - 0.5)
+
+      let capped
+      if (isSingleArtist) {
+        capped = filtered
+        LOG(`Step5 | single-artist mode — no diversity cap | ${capped.length} tracks`)
+      } else {
+        const capCount = new Map()
+        capped = []
+        for (const t of filtered) {
+          const artistId = t.artists?.[0]?.id
+          if (!artistId) { capped.push(t); continue }
+          const n = capCount.get(artistId) ?? 0
+          if (n < 3) { capped.push(t); capCount.set(artistId, n + 1) }
+        }
+        LOG(`Step5 | diversity cap (3/artist): ${filtered.length} → ${capped.length} tracks`)
+      }
+
+      LOG(`Pre-backfill pool: ${capped.length} tracks, need: ${targetSize}`)
+
+      // ── STEP 6: Genre backfill if still under target ──────────────────────
+      if (capped.length < targetSize) {
         setLoadingStep(`Backfilling to ${targetSize} tracks…`)
 
-        // Build a list of genre terms to try: detected genres first, then onboarding genres
         const genreTerms = [
           ...detectedGenres,
           ...(tasteProfile?.genres ?? []).map((g) => g.toLowerCase().replace(/[^a-z0-9-]/g, '-')),
         ].filter(Boolean)
 
-        for (const genre of genreTerms) {
-          if (tracks.length >= targetSize) break
-          const needed = Math.min((targetSize - tracks.length) * 3, 50)
-          try {
-            const res = await searchTracks(token, `genre:${genre}`, needed)
-            addTracks(res?.tracks?.items ?? [])
-          } catch {}
+        LOG(`Step6 | backfill genres to try: ${genreTerms.join(', ')}`)
+
+        const cappedIds = new Set(capped.map((t) => t.id))
+        const backfillCapCount = new Map()
+
+        const tryBackfill = (items) => {
+          for (const t of items) {
+            if (capped.length >= targetSize) break
+            if (!t?.id || cappedIds.has(t.id)) continue
+            if (minMs !== null && t.duration_ms < minMs) continue
+            if (maxMs !== null && t.duration_ms > maxMs) continue
+            if (!isSingleArtist) {
+              const artistId = t.artists?.[0]?.id
+              if (artistId) {
+                const n = backfillCapCount.get(artistId) ?? 0
+                if (n >= 3) continue
+                backfillCapCount.set(artistId, n + 1)
+              }
+            }
+            cappedIds.add(t.id)
+            capped.push(t)
+          }
         }
 
-        // Last resort: broad popularity search on the first detected genre
-        if (tracks.length < targetSize && genreTerms.length > 0) {
-          const needed = Math.min((targetSize - tracks.length) * 3, 50)
+        for (const genre of genreTerms) {
+          if (capped.length >= targetSize) break
           try {
-            const res = await searchTracks(token, genreTerms[0], needed)
-            addTracks(res?.tracks?.items ?? [])
-          } catch {}
+            const res = await searchTracks(token, `genre:${genre}`, 50)
+            const items = res?.tracks?.items ?? []
+            LOG(`Step6 | genre:${genre} | ${items.length} results`)
+            tryBackfill(items)
+            LOG(`Step6 | after genre:${genre} | pool now ${capped.length}`)
+          } catch (e) {
+            LOG(`Step6 | genre:${genre} | error:`, e.message)
+          }
         }
+
+        // Last resort: plain genre keyword search
+        if (capped.length < targetSize && genreTerms.length > 0) {
+          for (const genre of genreTerms.slice(0, 3)) {
+            if (capped.length >= targetSize) break
+            try {
+              const res = await searchTracks(token, genre, 50)
+              const items = res?.tracks?.items ?? []
+              LOG(`Step6 | keyword "${genre}" | ${items.length} results`)
+              tryBackfill(items)
+            } catch {}
+          }
+        }
+
+        LOG(`After Step 6 (backfill): ${capped.length} tracks`)
       }
 
-      if (tracks.length === 0) {
+      if (capped.length === 0) {
         setSuggestion(params.emptyResultSuggestion ?? null)
         throw new Error(
           `No tracks found for "${text}".${params.emptyResultSuggestion ? ' See suggestion below.' : ' Try a different prompt.'}`
         )
       }
 
-      // ── Final: shuffle to mix artists, arc by energy, then hard-cap at targetSize ──
-      const shuffled = tracks.sort(() => Math.random() - 0.5)
-      const arced = arrangeEnergyArc(shuffled.slice(0, targetSize))
-      // If we have fewer tracks than requested, take everything we got
-      const final = arced.slice(0, targetSize)
+      // ── STEP 7: Shuffle remaining, apply energy arc, slice to exact count ──
+      const shuffled = capped.sort(() => Math.random() - 0.5)
+      const arced    = arrangeEnergyArc(shuffled.slice(0, targetSize))
+      const final    = arced.slice(0, targetSize)
+
+      LOG(`Final playlist: ${final.length} tracks (requested ${targetSize})`)
 
       setPlaylist({
         name: params.playlistName || text,
@@ -289,8 +406,7 @@ export default function DiscoverPage() {
         useStore.getState().setSpotifyUser(me)
       }
       const pl = await createPlaylist(token, userId, playlist.name, playlist.description)
-      const uris = playlist.tracks.map((t) => t.uri)
-      await addTracksToPlaylist(token, pl.id, uris)
+      await addTracksToPlaylist(token, pl.id, playlist.tracks.map((t) => t.uri))
       setSavedUrl(pl.external_urls?.spotify)
     } catch (err) {
       setError('Failed to save playlist: ' + err.message)
@@ -313,7 +429,6 @@ export default function DiscoverPage() {
 
       {!lastfmUsername && <LastfmImport />}
 
-      {/* Prompt input */}
       <form onSubmit={handleSubmit} className="relative">
         <input
           value={prompt}
@@ -327,15 +442,12 @@ export default function DiscoverPage() {
           disabled={loading || !prompt.trim()}
           className="absolute right-3 top-1/2 -translate-y-1/2 w-9 h-9 rounded-lg bg-accent hover:bg-accent-hover disabled:opacity-50 flex items-center justify-center transition-all"
         >
-          {loading ? (
-            <Loader2 className="w-4 h-4 text-black animate-spin" />
-          ) : (
-            <Send className="w-4 h-4 text-black" />
-          )}
+          {loading
+            ? <Loader2 className="w-4 h-4 text-black animate-spin" />
+            : <Send className="w-4 h-4 text-black" />}
         </button>
       </form>
 
-      {/* Example prompts */}
       {!playlist && !loading && (
         <div className="space-y-2">
           <p className="text-xs text-text-muted uppercase tracking-widest font-semibold">Try asking for</p>
@@ -353,7 +465,6 @@ export default function DiscoverPage() {
         </div>
       )}
 
-      {/* Loading state */}
       {loading && (
         <div className="card flex items-center gap-4">
           <div className="w-10 h-10 rounded-xl bg-accent/10 flex items-center justify-center flex-shrink-0">
@@ -366,7 +477,6 @@ export default function DiscoverPage() {
         </div>
       )}
 
-      {/* Error + smart suggestion */}
       {error && (
         <div className="card border-red-500/20 bg-red-500/5 space-y-3">
           <p className="text-sm text-red-400">{error}</p>
@@ -385,7 +495,6 @@ export default function DiscoverPage() {
         </div>
       )}
 
-      {/* Playlist result */}
       {playlist && !loading && (
         <div className="space-y-4 animate-slide-up">
           <div className="flex items-start justify-between gap-4">
@@ -398,28 +507,20 @@ export default function DiscoverPage() {
             </div>
             <div className="flex gap-2 flex-shrink-0">
               {savedUrl ? (
-                <a
-                  href={savedUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="btn-primary flex items-center gap-2 text-sm"
-                >
+                <a href={savedUrl} target="_blank" rel="noopener noreferrer"
+                   className="btn-primary flex items-center gap-2 text-sm">
                   <ExternalLink className="w-4 h-4" />
                   Open in Spotify
                 </a>
               ) : (
-                <button
-                  onClick={saveToSpotify}
-                  disabled={saving}
-                  className="btn-primary flex items-center gap-2 text-sm"
-                >
+                <button onClick={saveToSpotify} disabled={saving}
+                        className="btn-primary flex items-center gap-2 text-sm">
                   {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
                   Save to Spotify
                 </button>
               )}
             </div>
           </div>
-
           <div className="space-y-2">
             {playlist.tracks.map((track, i) => (
               <TrackCard key={track.id} track={track} index={i} />
