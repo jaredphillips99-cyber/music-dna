@@ -51,7 +51,7 @@ const GENRE_SYNONYMS = {
   'deep-house':     [['deep house'], ['organic house'], ['melodic deep house']],
   'melodic-house':  [['melodic house'], ['organic house'], ['progressive house']],
   'tech-house':     [['tech house'], ['minimal tech'], ['techno']],
-  'melodic-techno': [['melodic techno'], ['melodic techno'], ['dark techno']],
+  'melodic-techno': [['melodic techno'], ['minimal techno'], ['dark techno']],
   'afro-house':     [['afro house'], ['afrobeats'], ['tribal house']],
   'drum-and-bass':  [['drum and bass'], ['dnb'], ['liquid funk']],
   'lo-fi':          [['lo-fi'], ['lofi'], ['chillhop']],
@@ -508,7 +508,9 @@ export default function DiscoverPage() {
       const isSingle    = params.isSingleArtistPlaylist === true
       // use_library: true → user's listening history is a primary source
       //              false → genre/artist/mood request; library is backfill only
-      const useLibrary      = params.use_library !== false // default true if absent
+      // Default false: genre/mood/artist prompts are the common case; defaulting true
+      // would flood genre playlists with unrelated user-library tracks.
+      const useLibrary      = params.use_library === true
       const releaseYearMin  = params.release_year_min ?? null
       const releaseYearMax  = params.release_year_max ?? null
       const sortByHits      = params.sort_by_hits === true
@@ -802,7 +804,7 @@ export default function DiscoverPage() {
           const alternatives = GENRE_KEYWORDS[g]?.slice(1) ?? [g.split('-')[0]]
           for (const kw of alternatives) {
             if (capped.length >= trackCount) break
-            const r = await searchTracksPaginated(token, kw, 30).catch(() => [])
+            const r = await searchTracksPaginated(token, `${kw}${yearFilter}`, 30).catch(() => [])
             absorb(r)
             stage(`Backfill L2 — "${kw}"`, capped.length)
           }

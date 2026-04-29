@@ -40,19 +40,41 @@ export default async function handler(req, res) {
 }
 
 Field rules:
-- artists: Array of exact Spotify artist names. Include every artist named in the prompt first. Resolve "artists I listen to" / "my favourites" / "artists I have demonstrated interest in" to real names from the spotifyTopArtists or lastfmTopArtists lists supplied below — pick the most genre-relevant. Pad to at least 4 complementary artists in the same genre. Max 10.
-- genres: 1-4 lowercase hyphenated Spotify genre slugs inferred from prompt + artists. Examples: "tech-house", "melodic-techno", "deep-house", "hip-hop", "lo-fi". Never leave empty.
-- energy: "low" | "medium" | "high" — infer from context (running/workout → high, studying → low, cooking → medium).
-- bpm_target: numeric BPM or null. "running" → 140-160, "workout" → 130-150, null if not specified.
-- duration_min_ms: "longer songs" / "extended tracks" / "no short tracks" → 240000. "over 5 min" → 300000. "over 6 min" → 360000. null otherwise.
-- track_count: integer. Extract from "30 tracks", "give me 40 songs", "50-song". Default 20. Max 50.
+- artists: Array of exact Spotify artist names. Include every artist named in the prompt first. For "similar to X" or "like X" prompts, include X plus 3-5 stylistically similar artists. Resolve "my favourites" / "artists I listen to" from spotifyTopArtists/lastfmTopArtists below — pick the most genre-relevant. Pad to at least 4 complementary artists total. Max 10.
+- genres: 1-4 lowercase hyphenated Spotify genre slugs inferred from prompt + artists. Examples: "tech-house", "melodic-techno", "deep-house", "hip-hop", "lo-fi", "r-n-b", "drum-and-bass". Never leave empty.
+- energy: "low" | "medium" | "high" — infer from context (running/workout → high, studying/sleeping → low, cooking/commute → medium).
+- bpm_target: numeric BPM or null. "running" → 150, "workout" → 140, null if not specified.
+- duration_min_ms: "longer songs" / "extended tracks" → 240000. "over 5 min" → 300000. "over 6 min" → 360000. null otherwise.
+- track_count: integer. Extract from "30 tracks", "40 songs", "50-song playlist". Default 20. Max 50.
 - mood: 1-3 word mood string e.g. "euphoric", "dark and driving", "warm and nostalgic".
 - playlistName: creative, evocative name (3-6 words).
 - description: 1-2 sentence evocative description of the vibe.
-- isSingleArtistPlaylist: true ONLY when user explicitly asks for one specific artist ("only Chris Stussy", "give me a Bicep playlist"). False in all other cases.
-- use_library: true when the prompt implies using the user's existing listening history ("based on what I listen to", "from my library", "my taste", "what I usually like", "songs I know"). false when the user requests a specific genre, artist, mood, or activity (workout, studying, etc.) without referencing their personal library.
-- release_year_min / release_year_max: integers or null. Extract decade/era references: "90s" → 1990/1999. "80s" → 1980/1989. "70s" → 1970/1979. "60s" → 1960/1969. "2000s" → 2000/2009. "2010s" → 2010/2019. "classic" with no decade → null/1994. "modern" or "new" → 2015/null. "recent" → 2020/null. null/null when no era is mentioned.
-- sort_by_hits: true when the user uses words like "biggest", "hits", "classics", "greatest", "best of", "top songs", "most popular", "anthems". false otherwise.`,
+- isSingleArtistPlaylist: true ONLY when user explicitly asks for one specific artist ("only Chris Stussy", "give me a Bicep playlist", "just Frank Ocean"). False in all other cases including "similar to X".
+- use_library: true ONLY when the prompt explicitly references the user's personal history ("based on what I listen to", "from my library", "my taste", "what I usually like", "songs I know", "my favourites"). false for ALL other prompts — genre requests, mood requests, activity requests, artist requests, era requests, "similar to X" requests. When uncertain, use false.
+- release_year_min / release_year_max: integers or null. "90s" → 1990/1999. "80s" → 1980/1989. "70s" → 1970/1979. "60s" → 1960/1969. "2000s" → 2000/2009. "2010s" → 2010/2019. "classic" (no decade) → null/1994. "modern"/"new"/"recent" → 2018/null. null/null when no era mentioned.
+- sort_by_hits: true when the user says "biggest", "hits", "classics", "greatest", "best of", "top songs", "most popular", "anthems", "top tracks". false otherwise.
+
+EXAMPLES — study these carefully:
+
+Prompt: "Late night deep house for cooking dinner"
+spotifyTopArtists: Bicep, Four Tet, Caribou
+{ "artists": ["Floating Points", "Bicep", "Four Tet", "Burial", "Hunee"], "genres": ["deep-house"], "energy": "low", "bpm_target": null, "duration_min_ms": null, "track_count": 20, "mood": "late night atmospheric", "playlistName": "Midnight Kitchen Sessions", "description": "Warm, rolling deep house to fill your kitchen with soul.", "isSingleArtistPlaylist": false, "use_library": false, "release_year_min": null, "release_year_max": null, "sort_by_hits": false }
+
+Prompt: "The biggest hip-hop hits of the 90s"
+spotifyTopArtists: Drake, Kendrick Lamar, J. Cole
+{ "artists": ["Notorious B.I.G", "Tupac Shakur", "Nas", "Jay-Z", "Wu-Tang Clan", "Snoop Dogg", "DMX", "OutKast"], "genres": ["hip-hop"], "energy": "high", "bpm_target": null, "duration_min_ms": null, "track_count": 20, "mood": "golden era triumphant", "playlistName": "90s Hip-Hop Anthems", "description": "The defining tracks that built hip-hop's golden decade.", "isSingleArtistPlaylist": false, "use_library": false, "release_year_min": 1990, "release_year_max": 1999, "sort_by_hits": true }
+
+Prompt: "Based on what I usually listen to, something for working out"
+spotifyTopArtists: Bicep, Chase & Status, Pendulum, Noisia
+{ "artists": ["Bicep", "Chase & Status", "Pendulum", "Noisia", "Sub Focus"], "genres": ["drum-and-bass", "electronic"], "energy": "high", "bpm_target": 170, "duration_min_ms": null, "track_count": 20, "mood": "intense energetic", "playlistName": "High Intensity Training", "description": "Fast-paced electronic and drum & bass drawn from your listening history.", "isSingleArtistPlaylist": false, "use_library": true, "release_year_min": null, "release_year_max": null, "sort_by_hits": false }
+
+Prompt: "Give me only Frank Ocean songs, all of them"
+spotifyTopArtists: Frank Ocean, The Weeknd, SZA
+{ "artists": ["Frank Ocean"], "genres": ["r-n-b"], "energy": "medium", "bpm_target": null, "duration_min_ms": null, "track_count": 30, "mood": "introspective soulful", "playlistName": "Frank Ocean Deep Dive", "description": "Every side of Frank Ocean — from Nostalgia Ultra to Blonde.", "isSingleArtistPlaylist": true, "use_library": false, "release_year_min": null, "release_year_max": null, "sort_by_hits": false }
+
+Prompt: "Something like Caribou but more danceable"
+spotifyTopArtists: Radiohead, Bon Iver, Sufjan Stevens
+{ "artists": ["Caribou", "Four Tet", "Jon Hopkins", "Bonobo", "Tycho", "Com Truise"], "genres": ["melodic-house", "indie-pop"], "energy": "medium", "bpm_target": null, "duration_min_ms": null, "track_count": 20, "mood": "warm psychedelic groove", "playlistName": "Like Caribou But Danceable", "description": "Organic, melodic electronic music with a pulse — for when you want to move but still feel something.", "isSingleArtistPlaylist": false, "use_library": false, "release_year_min": null, "release_year_max": null, "sort_by_hits": false }`,
 
     discovery: `You are a music taste analyst. Given a user's taste profile, generate 3 insightful observations about their listening personality in a JSON array of strings. Each insight should be specific, flattering, and interesting — like something a knowledgeable music-loving friend would say. Max 2 sentences each.
 

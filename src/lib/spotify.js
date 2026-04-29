@@ -131,7 +131,7 @@ export const getArtistAlbums = (token, artistId, limit = 10) =>
   spotifyFetch(`/artists/${artistId}/albums?include_groups=album,single&limit=${limit}`, token)
 
 export const getAlbumTracks = (token, albumId) =>
-  spotifyFetch(`/albums/${albumId}/tracks?limit=10`, token)
+  spotifyFetch(`/albums/${albumId}/tracks?limit=50`, token)
 
 export const getArtist = (token, artistId) =>
   spotifyFetch(`/artists/${artistId}`, token)
@@ -144,9 +144,13 @@ export async function createPlaylist(token, userId, name, description) {
 }
 
 // Feb 2026: endpoint renamed from /playlists/{id}/tracks → /playlists/{id}/items
+// Spotify accepts max 100 URIs per request — chunk if needed.
 export async function addTracksToPlaylist(token, playlistId, trackUris) {
-  return spotifyFetch(`/playlists/${playlistId}/items`, token, {
-    method: 'POST',
-    body: JSON.stringify({ uris: trackUris }),
-  })
+  const CHUNK = 100
+  for (let i = 0; i < trackUris.length; i += CHUNK) {
+    await spotifyFetch(`/playlists/${playlistId}/items`, token, {
+      method: 'POST',
+      body: JSON.stringify({ uris: trackUris.slice(i, i + CHUNK) }),
+    })
+  }
 }
