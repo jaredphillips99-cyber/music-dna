@@ -113,15 +113,41 @@ async function verifyPoolGenres(token, tracks, requestedGenres, cache) {
   return { verified, unverified, rejected }
 }
 
+// Known essential artists by era/genre — used as fallback when year-filtered pool is thin
+const ERA_SEED_ARTISTS = {
+  'hip-hop-90s': [
+    'Notorious B.I.G', 'Tupac Shakur', 'Nas', 'Jay-Z', 'Wu-Tang Clan',
+    'Snoop Dogg', 'DMX', 'Lauryn Hill', 'OutKast', 'Rakim',
+  ],
+}
+
+// Extracts the 4-digit release year from a Spotify track's album.release_date field.
+// release_date can be "YYYY", "YYYY-MM", or "YYYY-MM-DD".
+function getTrackYear(track) {
+  const d = track.album?.release_date
+  if (!d) return null
+  const y = parseInt(d.slice(0, 4), 10)
+  return isNaN(y) ? null : y
+}
+
+// Builds Spotify's year: filter syntax for use in search queries.
+// e.g. buildYearFilter(1990, 1999) → " year:1990-1999"
+function buildYearFilter(minYear, maxYear) {
+  if (!minYear && !maxYear) return ''
+  const lo = minYear ?? 1900
+  const hi = maxYear ?? new Date().getFullYear()
+  return ` year:${lo}-${hi}`
+}
+
 // Genre search: tries q=genre:{slug} first (Spotify field filter), then falls back
-// to plain-text keyword variants from GENRE_KEYWORDS. This matches the proven order
-// the user specified: genre: filter → plain text → artist-based (Step 2).
-async function searchGenreWithFallback(token, genreSlug, want = 30) {
-  // Attempt 1: genre: field filter
+// to plain-text keyword variants from GENRE_KEYWORDS. The yearFilter string (e.g.
+// " year:1990-1999") is appended to every query for API-level era filtering.
+async function searchGenreWithFallback(token, genreSlug, want = 30, yearFilter = '') {
+  // Attempt 1: genre: field filter + year
   try {
-    const r = await searchTracksPaginated(token, `genre:${genreSlug}`, want)
+    const r = await searchTracksPaginated(token, `genre:${genreSlug}${yearFilter}`, want)
     if (r.length > 0) {
-      LOG(`searchGenre | genre:${genreSlug} → ${r.length} tracks`)
+      LOG(`searchGenre | genre:${genreSlug}${yearFilter} → ${r.length} tracks`)
       return r
     }
     LOG(`searchGenre | genre:${genreSlug} returned 0, trying keywords`)
@@ -129,18 +155,18 @@ async function searchGenreWithFallback(token, genreSlug, want = 30) {
     LOG(`searchGenre | genre:${genreSlug} error: ${e.message}`)
   }
 
-  // Attempt 2: keyword variants (plain text, multiple queries merged)
+  // Attempt 2: keyword variants (plain text) + year
   const keywords = GENRE_KEYWORDS[genreSlug] ?? [genreSlug.replace(/-/g, ' ')]
   const seen = new Set()
   const tracks = []
   for (const kw of keywords.slice(0, 3)) {
     if (tracks.length >= want) break
     try {
-      const r = await searchTracksPaginated(token, kw, want)
+      const r = await searchTracksPaginated(token, `${kw}${yearFilter}`, want)
       for (const t of r) {
         if (t?.id && !seen.has(t.id)) { seen.add(t.id); tracks.push(t) }
       }
-      LOG(`searchGenre | "${kw}" → ${r.length} tracks`)
+      LOG(`searchGenre | "${kw}${yearFilter}" → ${r.length} tracks`)
     } catch (e) {
       LOG(`searchGenre | "${kw}" error: ${e.message}`)
     }
@@ -195,7 +221,7 @@ async function fetchArtistDiscography(token, artistId, artistName, maxAlbums = 5
         return (tracksRes?.items ?? []).map((t) => ({
           ...t,
           // Enrich with album data — album track objects omit this field
-          album: { id: album.id, name: album.name, images: album.images ?? [] },
+          album: { id: album.id, name: album.name, images: album.images ?? [], release_date: album.release_date },
         }))
       })
     )
@@ -284,6 +310,9 @@ function DebugPanel({ params, stages, diag }) {
                 <Row label="mood" value={params.mood || '—'} />
                 <Row label="use_library" value={String(params.use_library ?? false)} />
                 <Row label="single_artist" value={String(params.isSingleArtistPlaylist ?? false)} />
+                <Row label="release_year_min" value={params.release_year_min ?? '—'} />
+                <Row label="release_year_max" value={params.release_year_max ?? '—'} />
+                <Row label="sort_by_hits" value={String(params.sort_by_hits ?? false)} />
               </div>
             </div>
           )}
@@ -479,9 +508,14 @@ export default function DiscoverPage() {
       const isSingle    = params.isSingleArtistPlaylist === true
       // use_library: true → user's listening history is a primary source
       //              false → genre/artist/mood request; library is backfill only
-      const useLibrary  = params.use_library !== false // default true if absent
+      const useLibrary      = params.use_library !== false // default true if absent
+      const releaseYearMin  = params.release_year_min ?? null
+      const releaseYearMax  = params.release_year_max ?? null
+      const sortByHits      = params.sort_by_hits === true
+      // yearFilter is appended to every Spotify search query for API-level era filtering
+      const yearFilter      = buildYearFilter(releaseYearMin, releaseYearMax)
 
-      LOG(`artists=[${artists.join(', ')}] genres=[${genres.join(', ')}] count=${trackCount} use_library=${useLibrary}`)
+      LOG(`artists=[${artists.join(', ')}] genres=[${genres.join(', ')}] count=${trackCount} era=${releaseYearMin ?? '?'}-${releaseYearMax ?? '?'} sortByHits=${sortByHits} use_library=${useLibrary}`)
 
       // Raw pool — dedup by track ID, no filtering until Step 5
       const rawPool = new Map()
@@ -584,7 +618,7 @@ export default function DiscoverPage() {
 
       const genreSearchResults = await Promise.all(
         genres.slice(0, 4).map((g) =>
-          searchGenreWithFallback(token, g, 30).catch((e) => {
+          searchGenreWithFallback(token, g, 30, yearFilter).catch((e) => {
             LOG(`Step4 | genre "${g}" error:`, e.message)
             return []
           })
@@ -592,19 +626,69 @@ export default function DiscoverPage() {
       )
       for (const tracks of genreSearchResults) pool(tracks)
 
-      // Mood + artist name searches supplement the genre searches
+      // Mood + artist name searches also carry the year filter
       const supplementQueries = [
         ...(params.mood ? [params.mood] : []),
         ...artists.slice(0, 3),
       ]
       const supplementResults = await Promise.all(
         supplementQueries.map((q) =>
-          searchTracksPaginated(token, q, 20).catch(() => [])
+          searchTracksPaginated(token, `${q}${yearFilter}`, 20).catch(() => [])
         )
       )
       for (const tracks of supplementResults) pool(tracks)
 
       stage('Step 4 — genre + mood searches', rawPool.size)
+
+      // ── Step 4b: Year hard filter ─────────────────────────────────────────
+      // Applied to the full raw pool so tracks from ALL sources (library, discography,
+      // search) are era-filtered consistently. album.release_date is already present in
+      // track objects from /search, /me/top/tracks, and our enriched discography fetches.
+      if (releaseYearMin !== null || releaseYearMax !== null) {
+        const before = rawPool.size
+        for (const [id, t] of rawPool) {
+          const year = getTrackYear(t)
+          if (year === null) continue // no date — keep (rather than silently drop)
+          if (releaseYearMin !== null && year < releaseYearMin) { rawPool.delete(id); continue }
+          if (releaseYearMax !== null && year > releaseYearMax) { rawPool.delete(id) }
+        }
+        const label = `Step 4b — year filter (${releaseYearMin ?? '?'}–${releaseYearMax ?? '?'})`
+        stage(label, rawPool.size)
+        LOG(`Year filter removed ${before - rawPool.size} out-of-era tracks, ${rawPool.size} remain`)
+      }
+
+      // ── Step 4c: Era-specific fallback for thin pools ─────────────────────
+      // If the year-filtered pool is under 15 tracks and the request matches a known
+      // era/genre combo, seed with canonical artists from that era and re-apply the
+      // year filter to keep only their era-correct releases.
+      const isNinetiesRap =
+        releaseYearMin !== null && releaseYearMin >= 1990 &&
+        releaseYearMax !== null && releaseYearMax <= 1999 &&
+        genres.some((g) => ['hip-hop', 'rap'].includes(g.replace(/-/g, ' ')))
+
+      if (isNinetiesRap && rawPool.size < 15) {
+        LOG(`Step4c | 90s rap pool thin (${rawPool.size}), seeding era artists`)
+        setLoadingStep('Seeding with essential 90s rap artists…')
+        const eraResults = await Promise.all(
+          ERA_SEED_ARTISTS['hip-hop-90s'].map(async (name) => {
+            try {
+              const artist = await resolveArtist(token, name)
+              if (!artist) return []
+              return fetchArtistDiscography(token, artist.id, name, 3)
+            } catch { return [] }
+          })
+        )
+        for (const tracks of eraResults) pool(tracks)
+        // Re-apply year filter to new additions
+        for (const [id, t] of rawPool) {
+          const year = getTrackYear(t)
+          if (year === null) continue
+          if (releaseYearMin !== null && year < releaseYearMin) { rawPool.delete(id); continue }
+          if (releaseYearMax !== null && year > releaseYearMax) { rawPool.delete(id) }
+        }
+        stage('Step 4c — 90s rap era artists', rawPool.size)
+      }
+
       LOG(`Raw pool after all sources: ${rawPool.size} unique tracks`)
 
       // ── Step 5: Duration filter + popularity bias + diversity cap ─────────
@@ -614,20 +698,24 @@ export default function DiscoverPage() {
         stage(`Step 5a — duration filter (≥${Math.round(minMs / 60000)}min)`, filtered.length)
       }
 
-      // Popularity bias: for genre-specific requests, prefer tracks in the 20-60
-      // popularity range (genre-accurate deep cuts) over crossover pop hits (>70).
-      // The popularity field was removed in the Feb 2026 API update; this sort is a
-      // no-op when the field is absent — it does not exclude tracks.
-      if (genres.length > 0) {
+      // Sorting strategy depends on the request type.
+      // Note: popularity field was removed Feb 2026 — sorts are no-ops when absent.
+      if (sortByHits) {
+        // "biggest hits / classics / greatest" → sort by popularity DESC so well-known
+        // songs surface before deep cuts. Tracks without popularity data go to the end.
+        filtered.sort((a, b) => (b.popularity ?? -1) - (a.popularity ?? -1))
+        LOG('sortByHits: sorted by popularity desc')
+      } else if (genres.length > 0) {
+        // Genre-specific (non-hits) requests: prefer mid-range popularity (20-60),
+        // which tends to be more genre-accurate than crossover pop (>65).
         filtered.sort((a, b) => {
           const ap = a.popularity, bp = b.popularity
           if (ap == null && bp == null) return 0
-          if (ap == null) return -1 // no data → treat as genre-appropriate, keep first
+          if (ap == null) return -1 // no data → keep early (treat as genre-appropriate)
           if (bp == null) return 1
-          // Penalty for very high popularity (likely crossover pop)
           const aPenalty = ap > 65 ? ap - 65 : 0
           const bPenalty = bp > 65 ? bp - 65 : 0
-          return aPenalty - bPenalty // lower penalty = ranked higher
+          return aPenalty - bPenalty
         })
       } else {
         filtered.sort(() => Math.random() - 0.5)

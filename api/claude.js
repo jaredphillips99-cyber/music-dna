@@ -33,7 +33,10 @@ export default async function handler(req, res) {
   "playlistName": "string",
   "description": "string",
   "isSingleArtistPlaylist": false,
-  "use_library": false
+  "use_library": false,
+  "release_year_min": null,
+  "release_year_max": null,
+  "sort_by_hits": false
 }
 
 Field rules:
@@ -47,7 +50,9 @@ Field rules:
 - playlistName: creative, evocative name (3-6 words).
 - description: 1-2 sentence evocative description of the vibe.
 - isSingleArtistPlaylist: true ONLY when user explicitly asks for one specific artist ("only Chris Stussy", "give me a Bicep playlist"). False in all other cases.
-- use_library: true when the prompt implies using the user's existing listening history ("based on what I listen to", "from my library", "my taste", "what I usually like", "songs I know"). false when the user requests a specific genre, artist, mood, or activity (workout, studying, etc.) without referencing their personal library.`,
+- use_library: true when the prompt implies using the user's existing listening history ("based on what I listen to", "from my library", "my taste", "what I usually like", "songs I know"). false when the user requests a specific genre, artist, mood, or activity (workout, studying, etc.) without referencing their personal library.
+- release_year_min / release_year_max: integers or null. Extract decade/era references: "90s" → 1990/1999. "80s" → 1980/1989. "70s" → 1970/1979. "60s" → 1960/1969. "2000s" → 2000/2009. "2010s" → 2010/2019. "classic" with no decade → null/1994. "modern" or "new" → 2015/null. "recent" → 2020/null. null/null when no era is mentioned.
+- sort_by_hits: true when the user uses words like "biggest", "hits", "classics", "greatest", "best of", "top songs", "most popular", "anthems". false otherwise.`,
 
     discovery: `You are a music taste analyst. Given a user's taste profile, generate 3 insightful observations about their listening personality in a JSON array of strings. Each insight should be specific, flattering, and interesting — like something a knowledgeable music-loving friend would say. Max 2 sentences each.
 
