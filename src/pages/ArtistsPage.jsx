@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Loader2, RefreshCw, ExternalLink } from 'lucide-react'
 import { useSpotify } from '@/hooks/useSpotify'
-import { getTopArtists, getRelatedArtists } from '@/lib/spotify'
+import { getTopArtists } from '@/lib/spotify'
 import { getSimilarArtists } from '@/lib/lastfm'
 import useStore from '@/store/useStore'
 import clsx from 'clsx'
@@ -59,44 +59,43 @@ export default function ArtistsPage() {
       const token = await getToken()
       if (!token) throw new Error('Not authenticated')
 
-      const data = await getTopArtists(token, 'medium_term', 10)
-      setTopArtists(data.items || [])
+      // Fetch medium-term (6 months) and short-term (4 weeks) in parallel
+      const [medData, shortData] = await Promise.all([
+        getTopArtists(token, 'medium_term', 20),
+        getTopArtists(token, 'short_term', 20),
+      ])
+      const medItems = medData?.items ?? []
+      const shortItems = shortData?.items ?? []
+      setTopArtists(medItems)
 
-      // Discover related artists
-      const knownIds = new Set((data.items || []).map((a) => a.id))
-      const relatedMap = new Map()
+      // "New for you" = artists rising in recent listening but not in 6-month top
+      // Uses /artists/{id}/related-artists replacement: time-range delta is more
+      // reliable and uses only /me/top/artists which is unrestricted.
+      const medIds = new Set(medItems.map((a) => a.id))
+      const scoreMap = new Map()
 
-      await Promise.all(
-        (data.items || []).slice(0, 5).map(async (artist) => {
-          try {
-            const rel = await getRelatedArtists(token, artist.id)
-            ;(rel.artists || []).forEach((ra) => {
-              if (!knownIds.has(ra.id)) {
-                relatedMap.set(ra.id, {
-                  ...ra,
-                  score: (relatedMap.get(ra.id)?.score || 0) + 1,
-                })
-              }
-            })
-          } catch {}
-        })
-      )
+      shortItems.forEach((a, i) => {
+        if (!medIds.has(a.id)) {
+          // Higher score for artists appearing earlier in short-term list
+          scoreMap.set(a.id, { ...a, score: shortItems.length - i })
+        }
+      })
 
-      // Also merge Last.fm similar artists names for cross-referencing
-      if (lastfmUsername && data.items?.length) {
+      // Boost score for any artist whose name appears in Last.fm similar artists
+      if (lastfmUsername && medItems.length) {
         try {
-          const lfmSimilar = await getSimilarArtists(data.items[0].name, 20)
+          const lfmSimilar = await getSimilarArtists(medItems[0].name, 20)
           lfmSimilar.forEach((la) => {
-            for (const [, ra] of relatedMap) {
+            for (const [, ra] of scoreMap) {
               if (ra.name.toLowerCase() === la.name.toLowerCase()) {
-                ra.score += 1
+                ra.score += 5
               }
             }
           })
         } catch {}
       }
 
-      const sorted = [...relatedMap.values()]
+      const sorted = [...scoreMap.values()]
         .sort((a, b) => b.score - a.score)
         .slice(0, 12)
 
