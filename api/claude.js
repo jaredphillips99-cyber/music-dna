@@ -32,7 +32,8 @@ export default async function handler(req, res) {
   "mood": "string",
   "playlistName": "string",
   "description": "string",
-  "isSingleArtistPlaylist": false
+  "isSingleArtistPlaylist": false,
+  "use_library": false
 }
 
 Field rules:
@@ -45,7 +46,8 @@ Field rules:
 - mood: 1-3 word mood string e.g. "euphoric", "dark and driving", "warm and nostalgic".
 - playlistName: creative, evocative name (3-6 words).
 - description: 1-2 sentence evocative description of the vibe.
-- isSingleArtistPlaylist: true ONLY when user explicitly asks for one specific artist ("only Chris Stussy", "give me a Bicep playlist"). False in all other cases.`,
+- isSingleArtistPlaylist: true ONLY when user explicitly asks for one specific artist ("only Chris Stussy", "give me a Bicep playlist"). False in all other cases.
+- use_library: true when the prompt implies using the user's existing listening history ("based on what I listen to", "from my library", "my taste", "what I usually like", "songs I know"). false when the user requests a specific genre, artist, mood, or activity (workout, studying, etc.) without referencing their personal library.`,
 
     discovery: `You are a music taste analyst. Given a user's taste profile, generate 3 insightful observations about their listening personality in a JSON array of strings. Each insight should be specific, flattering, and interesting — like something a knowledgeable music-loving friend would say. Max 2 sentences each.
 
