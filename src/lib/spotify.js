@@ -69,31 +69,58 @@ async function spotifyFetch(path, token, options = {}) {
 
 export const getMe = (token) => spotifyFetch('/me', token)
 
-export const getTopArtists = (token, timeRange = 'medium_term', limit = 20) =>
+// /me/top/artists and /me/top/tracks support limit up to 50
+export const getTopArtists = (token, timeRange = 'medium_term', limit = 50) =>
   spotifyFetch(`/me/top/artists?time_range=${timeRange}&limit=${limit}`, token)
 
-export const getTopTracks = (token, timeRange = 'medium_term', limit = 20) =>
+export const getTopTracks = (token, timeRange = 'medium_term', limit = 50) =>
   spotifyFetch(`/me/top/tracks?time_range=${timeRange}&limit=${limit}`, token)
 
 export const getRecentlyPlayed = (token, limit = 20) =>
   spotifyFetch(`/me/player/recently-played?limit=${limit}`, token)
 
-// Broad artist search (name as free text)
+// Artist search — limit capped at 10 per Feb 2026 search restrictions
 export const searchArtists = (token, query, limit = 5) =>
-  spotifyFetch(`/search?q=${encodeURIComponent(query)}&type=artist&limit=${limit}`, token)
+  spotifyFetch(`/search?q=${encodeURIComponent(query)}&type=artist&limit=${Math.min(limit, 10)}`, token)
 
-// Strict artist search using Spotify's artist: field filter — more precise for known names
-export const searchArtistStrict = (token, name, limit = 3) =>
-  spotifyFetch(`/search?q=${encodeURIComponent(`artist:"${name}"`)}&type=artist&limit=${limit}`, token)
+export const searchArtistStrict = (token, name) =>
+  spotifyFetch(`/search?q=${encodeURIComponent(`artist:"${name}"`)}&type=artist&limit=1`, token)
 
-export const searchTracks = (token, query, limit = 5) =>
-  spotifyFetch(`/search?q=${encodeURIComponent(query)}&type=track&limit=${limit}`, token)
+// Single-page track search — limit capped at 10 per Feb 2026 search restrictions
+// Use searchTracksPaginated for larger result sets
+export const searchTracksPage = (token, query, offset = 0) =>
+  spotifyFetch(`/search?q=${encodeURIComponent(query)}&type=track&limit=10&offset=${offset}`, token)
 
-export const getArtistTopTracks = (token, artistId, market = 'US') =>
-  spotifyFetch(`/artists/${artistId}/top-tracks?market=${market}`, token)
+// Paginated track search — fetches up to `want` tracks across multiple pages of 10
+export async function searchTracksPaginated(token, query, want = 30) {
+  const tracks = []
+  const seen = new Set()
+  let offset = 0
+  while (tracks.length < want) {
+    let items
+    try {
+      const r = await searchTracksPage(token, query, offset)
+      items = r?.tracks?.items ?? []
+    } catch (e) {
+      console.log('[MusicDNA] searchTracksPaginated error:', query, offset, e.message)
+      break
+    }
+    for (const t of items) {
+      if (t?.id && !seen.has(t.id)) { seen.add(t.id); tracks.push(t) }
+    }
+    if (items.length < 10) break // no more pages
+    offset += 10
+  }
+  return tracks
+}
 
-export const getRelatedArtists = (token, artistId) =>
-  spotifyFetch(`/artists/${artistId}/related-artists`, token)
+// Discography — /artists/{id}/albums + /albums/{id}/tracks
+// GET /artists/{id}/top-tracks was removed in the Feb 2026 API update
+export const getArtistAlbums = (token, artistId, limit = 10) =>
+  spotifyFetch(`/artists/${artistId}/albums?include_groups=album,single&limit=${limit}`, token)
+
+export const getAlbumTracks = (token, albumId) =>
+  spotifyFetch(`/albums/${albumId}/tracks?limit=10`, token)
 
 export const getArtist = (token, artistId) =>
   spotifyFetch(`/artists/${artistId}`, token)
@@ -105,8 +132,9 @@ export async function createPlaylist(token, userId, name, description) {
   })
 }
 
+// Feb 2026: endpoint renamed from /playlists/{id}/tracks → /playlists/{id}/items
 export async function addTracksToPlaylist(token, playlistId, trackUris) {
-  return spotifyFetch(`/playlists/${playlistId}/tracks`, token, {
+  return spotifyFetch(`/playlists/${playlistId}/items`, token, {
     method: 'POST',
     body: JSON.stringify({ uris: trackUris }),
   })
