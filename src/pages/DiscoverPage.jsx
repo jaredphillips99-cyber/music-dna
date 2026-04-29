@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Send, Loader2, Save, ExternalLink, ChevronDown, ChevronUp } from 'lucide-react'
 import useStore from '@/store/useStore'
 import { useSpotify } from '@/hooks/useSpotify'
-import { getPlaylistParams } from '@/lib/claude'
+import { getPlaylistParams, getIconicTracks } from '@/lib/claude'
 import {
   searchArtists,
   searchArtistStrict,
@@ -139,6 +139,20 @@ function buildYearFilter(minYear, maxYear) {
   return ` year:${lo}-${hi}`
 }
 
+// Returns a track's effective popularity for sorting, with a 1.5× boost
+// for tracks released within the requested era. Compensates for iconic older
+// tracks that are streamed less today than mediocre recent releases.
+function boostedPopularity(track, releaseYearMin, releaseYearMax) {
+  const pop = track.popularity ?? 0
+  if (!releaseYearMin && !releaseYearMax) return pop
+  const year = getTrackYear(track)
+  if (year === null) return pop
+  const lo = releaseYearMin ?? 0
+  const hi = releaseYearMax ?? 9999
+  if (year >= lo && year <= hi) return Math.min(100, Math.round(pop * 1.5))
+  return pop
+}
+
 // Genre search: tries q=genre:{slug} first (Spotify field filter), then falls back
 // to plain-text keyword variants from GENRE_KEYWORDS. The yearFilter string (e.g.
 // " year:1990-1999") is appended to every query for API-level era filtering.
@@ -247,7 +261,7 @@ async function fetchArtistDiscography(token, artistId, artistName, maxAlbums = 5
 
 // ─── Debug panel ──────────────────────────────────────────────────────────────
 
-function DebugPanel({ params, stages, diag }) {
+function DebugPanel({ params, stages, diag, iconicSeeds }) {
   const [open, setOpen] = useState(false)
   if (!params && !diag) return null
   return (
@@ -313,6 +327,9 @@ function DebugPanel({ params, stages, diag }) {
                 <Row label="release_year_min" value={params.release_year_min ?? '—'} />
                 <Row label="release_year_max" value={params.release_year_max ?? '—'} />
                 <Row label="sort_by_hits" value={String(params.sort_by_hits ?? false)} />
+                {iconicSeeds != null && (
+                  <Row label="iconic_seeds" value={`${iconicSeeds.found} found · ${iconicSeeds.inFinal} in final`} />
+                )}
               </div>
             </div>
           )}
@@ -369,9 +386,10 @@ export default function DiscoverPage() {
   const [playlist, setPlaylist]       = useState(null)
   const [error, setError]             = useState(null)
   const [savedUrl, setSavedUrl]       = useState(null)
-  const [debugParams, setDebugParams] = useState(null)
-  const [debugStages, setDebugStages] = useState([])
-  const [debugDiag, setDebugDiag]     = useState(null)
+  const [debugParams, setDebugParams]         = useState(null)
+  const [debugStages, setDebugStages]         = useState([])
+  const [debugDiag, setDebugDiag]             = useState(null)
+  const [debugIconicSeeds, setDebugIconicSeeds] = useState(null)
 
   // Fetch + cache user's top artist names for Claude prompt enrichment
   async function ensureSpotifyHistory(token) {
@@ -397,6 +415,7 @@ export default function DiscoverPage() {
     setDebugParams(null)
     setDebugStages([])
     setDebugDiag(null)
+    setDebugIconicSeeds(null)
 
     const stages = []
     // verified/total are optional — only set on the genre-verification stage
@@ -516,6 +535,8 @@ export default function DiscoverPage() {
       const sortByHits      = params.sort_by_hits === true
       // yearFilter is appended to every Spotify search query for API-level era filtering
       const yearFilter      = buildYearFilter(releaseYearMin, releaseYearMax)
+      // deepCuts: invert the popularity bucket ratio so rare tracks are prioritised
+      const deepCuts        = /\b(deep cuts?|hidden gems?|b[- ]?sides?|obscure|underground|overlooked|rare)\b/i.test(text)
 
       LOG(`artists=[${artists.join(', ')}] genres=[${genres.join(', ')}] count=${trackCount} era=${releaseYearMin ?? '?'}-${releaseYearMax ?? '?'} sortByHits=${sortByHits} use_library=${useLibrary}`)
 
@@ -525,6 +546,59 @@ export default function DiscoverPage() {
 
       // Artist genre cache — scoped to this generate() call to avoid repeat /artists/{id} fetches
       const artistGenreCache = new Map()
+
+      // Tracks IDs that came from the Claude iconic pre-seed — tracked for debug panel
+      const iconicSeedIds = new Set()
+
+      // ── Step 0.5: Iconic track pre-seed ──────────────────────────────────
+      // When user asks for best/hits/classics of a specific genre+era, ask Claude to
+      // name the most culturally significant tracks, then search Spotify for each one
+      // directly using track+artist queries — far more reliable than genre browsing.
+      if (sortByHits && (releaseYearMin !== null || releaseYearMax !== null) && genres.length > 0) {
+        setLoadingStep('Identifying iconic tracks for this era…')
+        try {
+          const genreStr  = genres[0].replace(/-/g, ' ')
+          const decadeStr = releaseYearMin
+            ? `${String(releaseYearMin).slice(-2)}s (${releaseYearMin}–${releaseYearMax ?? releaseYearMin + 9})`
+            : 'recent years'
+
+          LOG(`Step0.5 | Requesting iconic ${genreStr} tracks from ${decadeStr}`)
+          const iconicRaw = await getIconicTracks(genreStr, decadeStr)
+          const iconicList = Array.isArray(iconicRaw) ? iconicRaw : []
+          LOG(`Step0.5 | Claude returned ${iconicList.length} iconic tracks`)
+
+          // Search Spotify for each track directly: track:"X" artist:"Y"
+          const CHUNK = 10
+          for (let i = 0; i < iconicList.length; i += CHUNK) {
+            const results = await Promise.allSettled(
+              iconicList.slice(i, i + CHUNK).map(async ({ track, artist }) => {
+                if (!track || !artist) return null
+                try {
+                  const r = await searchTracksPage(token, `track:"${track}" artist:"${artist}"`, 0)
+                  const hit = r?.tracks?.items?.[0] ?? null
+                  if (hit) LOG(`Step0.5 | ✓ ${hit.name} — ${hit.artists?.[0]?.name}`)
+                  else LOG(`Step0.5 | ✗ not found: ${track} — ${artist}`)
+                  return hit
+                } catch (e) {
+                  LOG(`Step0.5 | search error for "${track}": ${e.message}`)
+                  return null
+                }
+              })
+            )
+            for (const r of results) {
+              if (r.status === 'fulfilled' && r.value?.id) {
+                iconicSeedIds.add(r.value.id)
+                rawPool.set(r.value.id, r.value)
+              }
+            }
+          }
+
+          stage('Step 0.5 — iconic pre-seed', rawPool.size)
+          LOG(`Step0.5 | ${iconicSeedIds.size} iconic tracks seeded into pool`)
+        } catch (e) {
+          LOG('Step0.5 | Iconic pre-seed failed:', e.message)
+        }
+      }
 
       // ── Step 1: User's own top tracks ────────────────────────────────────
       // Primary when use_library=true (taste-based prompt).
@@ -700,13 +774,16 @@ export default function DiscoverPage() {
         stage(`Step 5a — duration filter (≥${Math.round(minMs / 60000)}min)`, filtered.length)
       }
 
-      // Sorting strategy depends on the request type.
-      // Note: popularity field was removed Feb 2026 — sorts are no-ops when absent.
-      if (sortByHits) {
-        // "biggest hits / classics / greatest" → sort by popularity DESC so well-known
-        // songs surface before deep cuts. Tracks without popularity data go to the end.
-        filtered.sort((a, b) => (b.popularity ?? -1) - (a.popularity ?? -1))
-        LOG('sortByHits: sorted by popularity desc')
+      // Pre-sort before diversity cap so the cap retains the best tracks per artist.
+      // Cultural era boost (1.5×) is applied when a decade filter is active.
+      if (sortByHits || deepCuts) {
+        // Sort highest effective popularity first; diversity cap will pick the best
+        // known track per artist. Final bucket assembly (Step 7) handles the 70/30 split.
+        filtered.sort((a, b) =>
+          boostedPopularity(b, releaseYearMin, releaseYearMax) -
+          boostedPopularity(a, releaseYearMin, releaseYearMax)
+        )
+        LOG(`Pre-sort boosted popularity desc (sortByHits=${sortByHits} deepCuts=${deepCuts})`)
       } else if (genres.length > 0) {
         // Genre-specific (non-hits) requests: prefer mid-range popularity (20-60),
         // which tends to be more genre-accurate than crossover pop (>65).
@@ -848,16 +925,39 @@ export default function DiscoverPage() {
         )
       }
 
-      // ── Step 7: Shuffle and slice to exact count ──────────────────────────
-      // Note: popularity field was removed in the Feb 2026 API update,
-      // so energy arc is based on shuffle only.
-      const final = capped
-        .sort(() => Math.random() - 0.5)
-        .slice(0, trackCount)
+      // ── Step 7: Final assembly ────────────────────────────────────────────
+      // For hits/best-of requests: split into iconic (effectivePop ≥ 70) and
+      // deeper cuts (<70). Fill 70% from iconic + 30% from cuts (inverted for
+      // deep-cuts prompts). Shortfall in one bucket is filled from the other.
+      // For all other requests: shuffle for variety.
+      let final
+      if (sortByHits || deepCuts) {
+        const ep = (t) => boostedPopularity(t, releaseYearMin, releaseYearMax)
+        const iconic = capped.filter((t) => ep(t) >= 70).sort((a, b) => ep(b) - ep(a))
+        const cuts   = capped.filter((t) => ep(t) <  70).sort((a, b) => ep(b) - ep(a))
+        const iconicTarget = deepCuts
+          ? Math.round(trackCount * 0.3)
+          : Math.round(trackCount * 0.7)
+        const iconicPick = iconic.slice(0, iconicTarget)
+        const cutsTarget = trackCount - iconicPick.length
+        const cutsPick   = cuts.slice(0, cutsTarget)
+        // If cuts bucket is short, top up from iconic overflow
+        const overflow   = trackCount - iconicPick.length - cutsPick.length
+        const extra      = overflow > 0 ? iconic.slice(iconicTarget, iconicTarget + overflow) : []
+        final = [...iconicPick, ...cutsPick, ...extra].slice(0, trackCount)
+        LOG(`Final: ${iconicPick.length} iconic (≥70ep) + ${cutsPick.length} cuts + ${extra.length} overflow`)
+      } else {
+        final = capped.sort(() => Math.random() - 0.5).slice(0, trackCount)
+      }
+
+      const iconicInFinal = final.filter((t) => iconicSeedIds.has(t.id)).length
+      setDebugIconicSeeds(iconicSeedIds.size > 0
+        ? { found: iconicSeedIds.size, inFinal: iconicInFinal }
+        : null)
 
       stage('Final playlist', final.length)
       setDebugStages([...stages])
-      LOG(`Done. ${final.length} tracks (requested ${trackCount})`)
+      LOG(`Done. ${final.length} tracks (requested ${trackCount}), ${iconicInFinal}/${iconicSeedIds.size} iconic seeds in final`)
 
       setPlaylist({
         name: params.playlistName || text,
@@ -962,7 +1062,7 @@ export default function DiscoverPage() {
           <div className="card border-red-500/20 bg-red-500/5">
             <p className="text-sm text-red-400">{error}</p>
           </div>
-          <DebugPanel params={debugParams} stages={debugStages} diag={debugDiag} />
+          <DebugPanel params={debugParams} stages={debugStages} diag={debugDiag} iconicSeeds={debugIconicSeeds} />
         </div>
       )}
 
@@ -1000,7 +1100,7 @@ export default function DiscoverPage() {
             ))}
           </div>
 
-          <DebugPanel params={debugParams} stages={debugStages} diag={debugDiag} />
+          <DebugPanel params={debugParams} stages={debugStages} diag={debugDiag} iconicSeeds={debugIconicSeeds} />
         </div>
       )}
     </div>

@@ -19,3 +19,6 @@ export const getDiscoveryInsights = (tasteProfile) =>
 
 export const getStatsInsight = (listeningData) =>
   claudeRequest('stats', null, listeningData)
+
+export const getIconicTracks = (genre, decade) =>
+  claudeRequest('iconic', `Genre: ${genre}. Decade: ${decade}.`, null)

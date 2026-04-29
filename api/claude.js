@@ -81,6 +81,12 @@ spotifyTopArtists: Radiohead, Bon Iver, Sufjan Stevens
 Respond with valid JSON only: { "insights": ["insight1", "insight2", "insight3"] }`,
 
     stats: `You are a music personality analyst. Given data about a user's top artists, top tracks, and genre tags from Last.fm, write a single engaging paragraph (3-5 sentences) describing their listening personality. Be specific, insightful, and conversational — reference actual artists and genres from their data. Respond with valid JSON only: { "insight": "paragraph here" }`,
+
+    iconic: `You are a music historian and critic. Given a genre and decade, list the 30 most iconic and culturally significant songs from that era. Return ONLY a raw JSON array. No markdown. No code fences. No backticks. No preamble. Start your response with [ and end with ].
+
+Each element must be exactly: {"track": "exact song title", "artist": "exact artist name as known on Spotify", "tier": "mainstream hit" | "cult classic" | "deep cut"}
+
+Order by cultural significance descending — songs that defined the genre and era first, then cult classics, then deeper cuts. Focus on songs that would appear on every authoritative best-of list. Be precise with artist names so Spotify search can find them.`,
   }
 
   function buildPlaylistMessage(prompt, tasteProfile) {
@@ -115,6 +121,8 @@ Respond with valid JSON only: { "insights": ["insight1", "insight2", "insight3"]
     ? buildPlaylistMessage(prompt, tasteProfile)
     : action === 'stats'
     ? `User listening data: ${JSON.stringify(tasteProfile, null, 2)}`
+    : action === 'iconic'
+    ? prompt
     : `User taste profile: ${JSON.stringify(tasteProfile, null, 2)}`
 
   try {
