@@ -69,6 +69,17 @@ async function spotifyFetch(path, token, options = {}) {
 
 export const getMe = (token) => spotifyFetch('/me', token)
 
+// Health check — returns raw status + body without throwing, so callers can inspect auth errors
+export async function spotifyHealthCheck(token) {
+  const res = await fetch('https://api.spotify.com/v1/me', {
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+  })
+  const text = await res.text()
+  let body
+  try { body = JSON.parse(text) } catch { body = text }
+  return { status: res.status, ok: res.ok, body }
+}
+
 // /me/top/artists and /me/top/tracks support limit up to 50
 export const getTopArtists = (token, timeRange = 'medium_term', limit = 50) =>
   spotifyFetch(`/me/top/artists?time_range=${timeRange}&limit=${limit}`, token)

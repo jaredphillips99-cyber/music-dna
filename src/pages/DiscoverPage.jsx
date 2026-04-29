@@ -6,6 +6,7 @@ import { getPlaylistParams } from '@/lib/claude'
 import {
   searchArtists,
   searchArtistStrict,
+  searchTracksPage,
   searchTracksPaginated,
   getTopArtists,
   getTopTracks,
@@ -14,6 +15,8 @@ import {
   getMe,
   createPlaylist,
   addTracksToPlaylist,
+  spotifyHealthCheck,
+  refreshAccessToken,
 } from '@/lib/spotify'
 import TrackCard from '@/components/Playlist/TrackCard'
 import LastfmImport from '@/components/Dashboard/LastfmImport'
@@ -113,9 +116,9 @@ async function fetchArtistDiscography(token, artistId, artistName, maxAlbums = 5
 
 // ─── Debug panel ──────────────────────────────────────────────────────────────
 
-function DebugPanel({ params, stages }) {
+function DebugPanel({ params, stages, diag }) {
   const [open, setOpen] = useState(false)
-  if (!params) return null
+  if (!params && !diag) return null
   return (
     <div className="border border-surface-4 rounded-xl overflow-hidden">
       <button
@@ -128,21 +131,59 @@ function DebugPanel({ params, stages }) {
 
       {open && (
         <div className="p-4 bg-surface-1 space-y-5 text-xs font-mono">
-          <div>
-            <p className="text-text-muted uppercase tracking-widest mb-2">Parsed by Claude</p>
-            <div className="grid grid-cols-2 gap-x-6 gap-y-1.5">
-              <Row label="artists" value={params.artists?.join(', ') || '—'} />
-              <Row label="genres" value={params.genres?.join(', ') || '—'} />
-              <Row label="energy" value={params.energy || '—'} />
-              <Row label="bpm_target" value={params.bpm_target ?? '—'} />
-              <Row label="duration_min_ms" value={params.duration_min_ms ?? '—'} />
-              <Row label="track_count" value={params.track_count ?? '—'} />
-              <Row label="mood" value={params.mood || '—'} />
-              <Row label="single_artist" value={String(params.isSingleArtistPlaylist ?? false)} />
-            </div>
-          </div>
 
-          {stages.length > 0 && (
+          {/* Auth diagnostics — shown first so auth failures are immediately visible */}
+          {diag && (
+            <div>
+              <p className="text-text-muted uppercase tracking-widest mb-2">Auth diagnostics</p>
+              <div className="space-y-1">
+                <div className="flex gap-2">
+                  <span className={`font-bold ${diag.health?.ok ? 'text-green-400' : 'text-red-400'}`}>
+                    GET /me → {diag.health?.status ?? '?'}
+                  </span>
+                  <span className="text-text-muted truncate">{diag.health?.summary}</span>
+                </div>
+                {diag.health?.rawBody && (
+                  <p className="text-text-muted break-all leading-relaxed">{diag.health.rawBody}</p>
+                )}
+                {diag.testSearch && (
+                  <div className="flex gap-2 mt-1">
+                    <span className={`font-bold ${diag.testSearch.error ? 'text-red-400' : 'text-green-400'}`}>
+                      GET /search?q=Drake → {diag.testSearch.error ? 'ERROR' : `${diag.testSearch.count} tracks`}
+                    </span>
+                    {diag.testSearch.error && (
+                      <span className="text-red-400 truncate">{diag.testSearch.error}</span>
+                    )}
+                  </div>
+                )}
+                {diag.refreshAttempted && (
+                  <p className={`mt-1 ${diag.refreshOk ? 'text-green-400' : 'text-red-400'}`}>
+                    Token refresh: {diag.refreshOk ? 'succeeded' : `failed — ${diag.refreshError}`}
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Claude params */}
+          {params && (
+            <div>
+              <p className="text-text-muted uppercase tracking-widest mb-2">Parsed by Claude</p>
+              <div className="grid grid-cols-2 gap-x-6 gap-y-1.5">
+                <Row label="artists" value={params.artists?.join(', ') || '—'} />
+                <Row label="genres" value={params.genres?.join(', ') || '—'} />
+                <Row label="energy" value={params.energy || '—'} />
+                <Row label="bpm_target" value={params.bpm_target ?? '—'} />
+                <Row label="duration_min_ms" value={params.duration_min_ms ?? '—'} />
+                <Row label="track_count" value={params.track_count ?? '—'} />
+                <Row label="mood" value={params.mood || '—'} />
+                <Row label="single_artist" value={String(params.isSingleArtistPlaylist ?? false)} />
+              </div>
+            </div>
+          )}
+
+          {/* Pipeline stages */}
+          {stages?.length > 0 && (
             <div>
               <p className="text-text-muted uppercase tracking-widest mb-2">Pipeline stages</p>
               <table className="w-full border-collapse">
@@ -190,6 +231,7 @@ export default function DiscoverPage() {
   const [savedUrl, setSavedUrl]       = useState(null)
   const [debugParams, setDebugParams] = useState(null)
   const [debugStages, setDebugStages] = useState([])
+  const [debugDiag, setDebugDiag]     = useState(null)
 
   // Fetch + cache user's top artist names for Claude prompt enrichment
   async function ensureSpotifyHistory(token) {
@@ -214,6 +256,7 @@ export default function DiscoverPage() {
     setSavedUrl(null)
     setDebugParams(null)
     setDebugStages([])
+    setDebugDiag(null)
 
     const stages = []
     const stage = (label, count) => {
@@ -221,12 +264,88 @@ export default function DiscoverPage() {
       LOG(`[${label}]: ${count} tracks`)
     }
 
+    // Accumulate diagnostics as we go so the panel updates live
+    const diag = {}
+    const pushDiag = (patch) => { Object.assign(diag, patch); setDebugDiag({ ...diag }) }
+
     try {
-      const token = await getToken()
+      let token = await getToken()
       if (!token) throw new Error('Not authenticated — please reconnect Spotify')
 
       const { spotifyTokenExpiry } = useStore.getState()
-      LOG(`Token OK: ${token.slice(0, 8)}… expires in ${Math.round((spotifyTokenExpiry - Date.now()) / 1000)}s`)
+      LOG(`Token: ${token.slice(0, 8)}… stored expiry in ${Math.round((spotifyTokenExpiry - Date.now()) / 1000)}s`)
+
+      // ── Auth health check ─────────────────────────────────────────────────
+      // Calls GET /me with the current token. Returns the raw HTTP status so
+      // we can distinguish 401 (expired/invalid token) from 403 (missing scope).
+      setLoadingStep('Verifying Spotify auth…')
+      let health = await spotifyHealthCheck(token)
+      LOG(`Health check: ${health.status}`, JSON.stringify(health.body).slice(0, 200))
+      pushDiag({
+        health: {
+          status: health.status,
+          ok: health.ok,
+          summary: health.ok
+            ? `Logged in as ${health.body?.display_name || health.body?.id || 'unknown'}`
+            : health.body?.error?.message || JSON.stringify(health.body).slice(0, 100),
+          rawBody: JSON.stringify(health.body).slice(0, 200),
+        },
+      })
+
+      // If token is rejected, attempt one force-refresh before giving up
+      if (!health.ok && health.status === 401) {
+        LOG('Token rejected — attempting force-refresh')
+        pushDiag({ refreshAttempted: true })
+        try {
+          const { spotifyRefreshToken, setSpotifyAuth } = useStore.getState()
+          const refreshed = await refreshAccessToken(spotifyRefreshToken)
+          setSpotifyAuth(
+            refreshed.access_token,
+            refreshed.refresh_token || spotifyRefreshToken,
+            refreshed.expires_in,
+          )
+          token = refreshed.access_token
+          LOG('Force-refresh succeeded, re-checking health')
+          pushDiag({ refreshOk: true })
+
+          // Re-run health check with new token
+          health = await spotifyHealthCheck(token)
+          LOG(`Health check (post-refresh): ${health.status}`)
+          pushDiag({
+            health: {
+              status: health.status,
+              ok: health.ok,
+              summary: health.ok
+                ? `Logged in as ${health.body?.display_name || health.body?.id} (after refresh)`
+                : health.body?.error?.message || JSON.stringify(health.body).slice(0, 100),
+              rawBody: JSON.stringify(health.body).slice(0, 200),
+            },
+          })
+        } catch (e) {
+          LOG('Force-refresh failed:', e.message)
+          pushDiag({ refreshOk: false, refreshError: e.message })
+        }
+      }
+
+      if (!health.ok) {
+        if (health.status === 401)
+          throw new Error('Spotify auth failed (401) — token is invalid or expired. Please disconnect and reconnect Spotify.')
+        if (health.status === 403)
+          throw new Error('Spotify permission denied (403) — a required scope is missing. Please disconnect and reconnect Spotify to grant fresh permissions.')
+        throw new Error(`Spotify API error ${health.status}: ${JSON.stringify(health.body).slice(0, 100)}`)
+      }
+
+      // ── Test search: hardcoded Drake query to verify search works at all ──
+      LOG('Running test search: q=Drake')
+      try {
+        const testRes = await searchTracksPage(token, 'Drake', 0)
+        const testCount = testRes?.tracks?.items?.length ?? 0
+        LOG(`Test search (Drake): ${testCount} tracks, first="${testRes?.tracks?.items?.[0]?.name}"`)
+        pushDiag({ testSearch: { count: testCount, error: null } })
+      } catch (e) {
+        LOG('Test search (Drake) FAILED:', e.message)
+        pushDiag({ testSearch: { count: 0, error: e.message } })
+      }
 
       // ── Step 0: Parse prompt with Claude ─────────────────────────────────
       const topArtistNames = await ensureSpotifyHistory(token)
@@ -464,6 +583,7 @@ export default function DiscoverPage() {
     } catch (err) {
       LOG('generate() error:', err.message)
       setDebugStages([...stages])
+      setDebugDiag({ ...diag })
       setError(err.message || 'Something went wrong. Try a different prompt.')
     } finally {
       setLoading(false)
@@ -558,7 +678,7 @@ export default function DiscoverPage() {
           <div className="card border-red-500/20 bg-red-500/5">
             <p className="text-sm text-red-400">{error}</p>
           </div>
-          <DebugPanel params={debugParams} stages={debugStages} />
+          <DebugPanel params={debugParams} stages={debugStages} diag={debugDiag} />
         </div>
       )}
 
@@ -596,7 +716,7 @@ export default function DiscoverPage() {
             ))}
           </div>
 
-          <DebugPanel params={debugParams} stages={debugStages} />
+          <DebugPanel params={debugParams} stages={debugStages} diag={debugDiag} />
         </div>
       )}
     </div>
